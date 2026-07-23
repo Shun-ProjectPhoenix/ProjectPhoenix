@@ -54,6 +54,11 @@ st.markdown(
         background-color: white;
         box-shadow: 0 4px 16px rgba(15, 35, 70, 0.05);
     }
+    [data-testid="stMetric"] label,
+    [data-testid="stMetric"] [data-testid="stMetricValue"],
+    [data-testid="stMetric"] [data-testid="stMetricDelta"] {
+    color: #111827 !important;
+    }
 
     div.stButton > button {
         width: 100%;
