@@ -4,11 +4,37 @@ import calendar
 import html
 import sqlite3
 from datetime import date, timedelta
-from urllib.parse import urlsplit
 
 import pandas as pd
 import streamlit as st
 
+from components import (
+    CATEGORY_OPTIONS,
+    EDIT_TRIP_SELECT_KEY,
+    RESERVATION_SERVICE_OPTIONS,
+    RESERVATION_STATUS_OPTIONS,
+    RESERVATION_TYPE_OPTIONS,
+    SERVICE_CSS_CLASSES,
+    SERVICE_ICONS,
+    _format_amount,
+    _format_date,
+    _month_bounds,
+    _reservation_bar_label,
+    _reservation_matches_day,
+    _reservation_overlaps_range,
+    _reservation_period_display,
+    _safe_reservation_url,
+    _shift_month,
+    _status_line,
+    format_reservation_line,
+    format_reservation_month_line,
+    format_trip_line,
+    pop_trip_jump,
+    render_reservation_card,
+    render_trip_card,
+    render_trip_jump_button,
+    safe_fetch,
+)
 from database import (
     delete_reservation,
     delete_trip,
@@ -26,152 +52,6 @@ from database import (
     update_reservation,
     update_trip,
 )
-
-ALLOWED_URL_SCHEMES = {"http", "https"}
-
-CATEGORY_OPTIONS = ["業務", "プライベート", "未分類"]
-RESERVATION_TYPE_OPTIONS = ["往路", "ホテル", "復路", "その他"]
-RESERVATION_STATUS_OPTIONS = ["予約済み", "未予約", "キャンセル"]
-RESERVATION_SERVICE_OPTIONS = ["えきねっと", "スマートEX", "スカイマーク", "Agoda", "その他"]
-
-# サービス → カレンダーの色分けCSSクラス対応表。
-# サービスが増えたらここに1行追加するだけで対応できる。
-SERVICE_CSS_CLASSES = {
-    "えきねっと": "cal-bar-ekinet",
-    "スマートEX": "cal-bar-smartex",
-    "スカイマーク": "cal-bar-skymark",
-    "Agoda": "cal-bar-agoda",
-    "その他": "cal-bar-other",
-}
-
-# サービス → カレンダー表示用アイコン対応表。
-SERVICE_ICONS = {
-    "えきねっと": "🚄",
-    "スマートEX": "🚄",
-    "スカイマーク": "✈️",
-    "Agoda": "🏨",
-    "その他": "📌",
-}
-
-
-def _format_date(iso_date: str) -> str:
-    return date.fromisoformat(iso_date).strftime("%Y/%m/%d")
-
-
-def _format_amount(amount: int | None) -> str:
-    return f"{int(amount or 0):,}円"
-
-
-def _status_line(label: str, is_ok: bool) -> str:
-    if is_ok:
-        return f"✅ {label}"
-    return f"⚠️ {label}未予約"
-
-
-def _safe_reservation_url(raw_url: str | None) -> str | None:
-    """予約確認URLを表示用に安全化する。
-
-    http/https以外のスキーム（javascript:, data:, file: など）は
-    リンクとして扱わずNoneを返す。スキームが無い場合はhttps://を補う。
-    保存されている生データそのものは変更しない（表示時のみの判定）。
-    """
-    if not raw_url:
-        return None
-
-    url = raw_url.strip()
-
-    if not url:
-        return None
-
-    parsed = urlsplit(url)
-
-    if not parsed.scheme:
-        url = f"https://{url}"
-        parsed = urlsplit(url)
-
-    if parsed.scheme not in ALLOWED_URL_SCHEMES or not parsed.netloc:
-        return None
-
-    return url
-
-
-def _reservation_status_suffix(status: str) -> str:
-    if status == "キャンセル":
-        return "（キャンセル）"
-    if status == "未予約":
-        return "（未予約）"
-    return ""
-
-
-def _reservation_period_display(reservation: sqlite3.Row) -> str:
-    if reservation["reservation_type"] == "ホテル":
-        check_in_raw = reservation["check_in_date"] or reservation["reservation_date"]
-        check_out_raw = reservation["check_out_date"]
-
-        if check_out_raw:
-            return f"{_format_date(check_in_raw)}〜{_format_date(check_out_raw)}"
-
-        return _format_date(check_in_raw)
-
-    return _format_date(reservation["reservation_date"])
-
-
-def _hotel_stay_phase(check_in: date, check_out: date | None, day: date) -> str:
-    if check_out is None or day == check_in:
-        return "チェックイン"
-    if day == check_out:
-        return "チェックアウト"
-    return "宿泊中"
-
-
-def _reservation_overlaps_range(
-    reservation: sqlite3.Row, range_start: date, range_end: date
-) -> bool:
-    if reservation["reservation_type"] == "ホテル":
-        check_in = date.fromisoformat(
-            reservation["check_in_date"] or reservation["reservation_date"]
-        )
-        check_out_raw = reservation["check_out_date"]
-        check_out = date.fromisoformat(check_out_raw) if check_out_raw else check_in
-        return check_in <= range_end and check_out >= range_start
-
-    reservation_day = date.fromisoformat(reservation["reservation_date"])
-    return range_start <= reservation_day <= range_end
-
-
-def _reservation_matches_day(reservation: sqlite3.Row, day: date) -> bool:
-    return _reservation_overlaps_range(reservation, day, day)
-
-
-def _reservation_bar_label(reservation: sqlite3.Row, day: date) -> str:
-    service = reservation["reservation_service"]
-    icon = SERVICE_ICONS.get(service, "📌")
-    status_suffix = _reservation_status_suffix(reservation["status"])
-
-    if reservation["reservation_type"] == "ホテル":
-        check_in = date.fromisoformat(
-            reservation["check_in_date"] or reservation["reservation_date"]
-        )
-        check_out_raw = reservation["check_out_date"]
-        check_out = date.fromisoformat(check_out_raw) if check_out_raw else None
-        phase = _hotel_stay_phase(check_in, check_out, day)
-        return f"{icon} {phase}・{service}{status_suffix}"
-
-    return f"{icon} {reservation['reservation_type']}・{service}{status_suffix}"
-
-
-def _shift_month(target_date: date, delta: int) -> date:
-    month_index = target_date.month - 1 + delta
-    year = target_date.year + month_index // 12
-    month = month_index % 12 + 1
-    return date(year, month, 1)
-
-
-def _month_bounds(target_date: date) -> tuple[date, date]:
-    month_start = date(target_date.year, target_date.month, 1)
-    _, last_day_num = calendar.monthrange(target_date.year, target_date.month)
-    month_end = date(target_date.year, target_date.month, last_day_num)
-    return month_start, month_end
 
 
 # --------------------------------------------------
@@ -337,14 +217,123 @@ st.markdown(
         border: 1px dashed rgba(255, 255, 255, 0.85);
     }
 
+    /* 予約詳細カードの項目行：「ラベル」を上、「値」を下に積む。
+       横並びの「ラベル：値」だと、スマホで値が長いときに詰まったり
+       折り返して読みにくくなるため、幅に関わらず常に縦積みにしている。 */
+    .rescard-fields {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        margin: 10px 0;
+    }
+
+    .rescard-field {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+    }
+
+    /* ライト／ダークどちらのStreamlitテーマでも読めるよう、
+       色は指定せずopacityだけで「ラベル」を薄く見せる
+       （文字色そのものはテーマの既定色を継承する）。 */
+    .rescard-label {
+        font-size: 0.72rem;
+        font-weight: 600;
+        opacity: 0.65;
+    }
+
+    .rescard-label-url {
+        margin-top: 10px;
+        margin-bottom: 4px;
+    }
+
+    .rescard-value {
+        font-size: 0.95rem;
+        word-break: break-word;
+        overflow-wrap: anywhere;
+    }
+
+    .rescard-value-muted {
+        opacity: 0.55;
+    }
+
+    /* スマホ幅（700px以下）向けの調整。
+       PC向けレイアウト（wide、横並びカラム等）はそのまま維持し、
+       ここでは余白・文字サイズ・カレンダーの詰まり具合のみを調整する。 */
     @media (max-width: 700px) {
         .block-container {
-            padding-left: 0.8rem;
-            padding-right: 0.8rem;
+            padding-left: 0.7rem;
+            padding-right: 0.7rem;
+        }
+
+        .tripflow-header {
+            padding: 16px;
         }
 
         .tripflow-header h1 {
-            font-size: 1.55rem;
+            font-size: 1.4rem;
+        }
+
+        .tripflow-header p {
+            font-size: 0.82rem;
+        }
+
+        [data-testid="stMetric"] {
+            padding: 10px;
+        }
+
+        div.stButton > button,
+        div.stLinkButton > a {
+            font-size: 0.85rem;
+            padding: 0.5rem 0.6rem;
+            min-height: 2.4rem;
+        }
+
+        .rescard-label {
+            font-size: 0.68rem;
+        }
+
+        .rescard-value {
+            font-size: 0.9rem;
+        }
+
+        /* カレンダーは作り直さず、構造（グリッド／日付選択詳細）は
+           そのまま維持する。スマホでは「横スクロールで7列目まで見に行く」
+           操作が発生しないよう、固定のmin-widthを解除し、7列を常に
+           画面幅いっぱいに収める（minmax(0, 1fr)）。 */
+        .cal-grid {
+            grid-template-columns: repeat(7, minmax(0, 1fr));
+            gap: 3px;
+            min-width: 0;
+            width: 100%;
+        }
+
+        .cal-cell {
+            min-height: 48px;
+            padding: 3px 2px;
+            border-radius: 6px;
+            overflow: hidden;
+        }
+
+        .cal-daynum {
+            font-size: 0.68rem;
+            margin-bottom: 1px;
+        }
+
+        /* セル幅が非常に狭くなるため、バーはさらに小さく。
+           長い出張名・予約名は.cal-bar側の
+           white-space:nowrap/overflow:hidden/text-overflow:ellipsis
+           （共通スタイルで定義済み）により自動的に「…」で省略される。 */
+        .cal-bar {
+            font-size: 0.56rem;
+            padding: 1px 3px;
+            margin-bottom: 1px;
+            border-radius: 4px;
+        }
+
+        .cal-weekday {
+            font-size: 0.66rem;
+            padding: 2px 0;
         }
     }
     </style>
@@ -453,7 +442,15 @@ with trips_tab:
             else:
                 st.success(f"「{trip_name}」を保存しました。")
 
-    all_trips = fetch_trips()
+    all_trips = safe_fetch(
+        fetch_trips,
+        default=[],
+        error_message="出張データの読み込みに失敗しました。時間をおいて再度お試しください。",
+    )
+
+    # ホーム画面の各項目からの「ジャンプ」を、あればここで1回だけ受け取る。
+    # 出張が無い場合でも呼び出し、古い移動要求がsession_stateに残らないようにする。
+    jump_trip_id, jump_reservation_id, jump_source_label = pop_trip_jump()
 
     st.divider()
     st.subheader("出張の編集・削除")
@@ -471,10 +468,21 @@ with trips_tab:
             for trip in all_trips
         }
 
+        if jump_trip_id is not None and jump_trip_id in trip_options:
+            st.session_state[EDIT_TRIP_SELECT_KEY] = jump_trip_id
+            if jump_source_label:
+                st.info(
+                    f"「{jump_source_label}」から移動しました。"
+                    "該当の出張を選択しています。"
+                )
+        else:
+            jump_reservation_id = None
+
         selected_id = st.selectbox(
             "編集する出張を選択",
             options=list(trip_options.keys()),
             format_func=lambda trip_id: trip_options[trip_id],
+            key=EDIT_TRIP_SELECT_KEY,
         )
 
         selected_trip = fetch_trip(selected_id)
@@ -556,7 +564,11 @@ with trips_tab:
 
                 else:
                     st.success(f"「{edit_name}」を更新しました。")
-                    all_trips = fetch_trips()
+                    all_trips = safe_fetch(
+                        fetch_trips,
+                        default=[],
+                        error_message="出張データの読み込みに失敗しました。時間をおいて再度お試しください。",
+                    )
 
         confirm_key = f"confirm_delete_{selected_id}"
 
@@ -588,8 +600,14 @@ with trips_tab:
 
                     else:
                         st.session_state[confirm_key] = False
-                        st.success(f"「{selected_trip['name']}」を削除しました。")
-                        all_trips = fetch_trips()
+                        # 削除した出張のIDがセレクトボックスの状態に残ったままだと、
+                        # 次の描画でoptionsに存在しないIDのformat_funcが呼ばれて
+                        # KeyErrorになるため、選択状態もあわせてリセットする。
+                        st.session_state.pop(EDIT_TRIP_SELECT_KEY, None)
+                        st.toast(
+                            f"「{selected_trip['name']}」を削除しました。", icon="🗑️"
+                        )
+                        st.rerun()
 
             with confirm_col2:
                 if st.button(
@@ -746,7 +764,12 @@ with trips_tab:
                 else:
                     st.success(f"「{reservation_title}」を追加しました。")
 
-        reservations = fetch_reservations_by_trip(selected_id)
+        reservations = safe_fetch(
+            fetch_reservations_by_trip,
+            selected_id,
+            default=[],
+            error_message="予約データの読み込みに失敗しました。時間をおいて再度お試しください。",
+        )
 
         st.markdown("#### 予約の編集・削除")
 
@@ -762,6 +785,14 @@ with trips_tab:
                 )
                 for reservation in reservations
             }
+
+            if (
+                jump_reservation_id is not None
+                and jump_reservation_id in reservation_options
+            ):
+                st.session_state[f"select_reservation_{selected_id}"] = (
+                    jump_reservation_id
+                )
 
             selected_reservation_id = st.selectbox(
                 "編集する予約を選択",
@@ -990,6 +1021,12 @@ with trips_tab:
 
                         else:
                             st.session_state[reservation_confirm_key] = False
+                            # 削除した予約のIDがセレクトボックスの状態に残ったままだと、
+                            # 次の描画でoptionsに存在しないIDのformat_funcが呼ばれて
+                            # KeyErrorになるため、選択状態もあわせてリセットする。
+                            st.session_state.pop(
+                                f"select_reservation_{selected_id}", None
+                            )
                             st.toast(
                                 f"「{selected_reservation['title']}」を削除しました。",
                                 icon="🗑️",
@@ -1004,7 +1041,20 @@ with trips_tab:
                     ):
                         st.session_state[reservation_confirm_key] = False
 
+        st.markdown("#### 予約の詳細")
+
         if reservations:
+            for reservation in reservations:
+                icon = SERVICE_ICONS.get(reservation["reservation_service"], "📌")
+
+                with st.expander(
+                    f"{icon} {reservation['reservation_type']}・"
+                    f"{reservation['reservation_service']}：{reservation['title']}"
+                ):
+                    render_reservation_card(reservation)
+
+            st.markdown("#### 予約一覧（表）")
+
             reservations_df = pd.DataFrame(
                 [
                     {
@@ -1071,12 +1121,28 @@ with trips_tab:
 # ホーム画面
 # --------------------------------------------------
 with home_tab:
-    upcoming_trips = fetch_upcoming_trips(today, limit=3)
+    upcoming_trips = safe_fetch(
+        fetch_upcoming_trips,
+        today,
+        limit=3,
+        default=[],
+        error_message="出張データの読み込みに失敗しました。時間をおいて再度お試しください。",
+    )
 
     this_month_start, this_month_end = _month_bounds(today)
-    this_month_trips = fetch_trips_in_range(this_month_start, this_month_end)
-    this_month_reservations = fetch_reservations_in_range(
-        this_month_start, this_month_end
+    this_month_trips = safe_fetch(
+        fetch_trips_in_range,
+        this_month_start,
+        this_month_end,
+        default=[],
+        error_message="出張データの読み込みに失敗しました。時間をおいて再度お試しください。",
+    )
+    this_month_reservations = safe_fetch(
+        fetch_reservations_in_range,
+        this_month_start,
+        this_month_end,
+        default=[],
+        error_message="予約データの読み込みに失敗しました。時間をおいて再度お試しください。",
     )
 
     monthly_cost = sum(
@@ -1110,25 +1176,33 @@ with home_tab:
     with st.expander(f"🧳 出張予定：{trip_count}件の内訳"):
         if this_month_trips:
             for trip in this_month_trips:
-                st.markdown(
-                    f"- **{trip['name']}**　"
-                    f"{_format_date(trip['start_date'])} 〜 {_format_date(trip['end_date'])}"
-                    f"　／　{trip['destination']}"
-                )
+                line_col, button_col = st.columns([4, 1])
+                with line_col:
+                    st.markdown(format_trip_line(trip))
+                with button_col:
+                    render_trip_jump_button(
+                        "詳細へ",
+                        trip["id"],
+                        f"出張予定：{trip['name']}",
+                        key=f"jump_trip_month_{trip['id']}",
+                    )
         else:
             st.caption("今月の出張はありません。")
 
     with st.expander(f"🎫 予約：{reservation_count}件の内訳"):
         if this_month_reservations:
             for reservation in this_month_reservations:
-                icon = SERVICE_ICONS.get(reservation["reservation_service"], "📌")
-                status_suffix = _reservation_status_suffix(reservation["status"])
-                st.markdown(
-                    f"- {icon} {reservation['reservation_type']}・"
-                    f"{reservation['reservation_service']}／{reservation['title']}／"
-                    f"{_reservation_period_display(reservation)}／"
-                    f"{_format_amount(reservation['amount'])}{status_suffix}"
-                )
+                line_col, button_col = st.columns([4, 1])
+                with line_col:
+                    st.markdown(format_reservation_line(reservation))
+                with button_col:
+                    render_trip_jump_button(
+                        "詳細へ",
+                        reservation["trip_id"],
+                        f"予約：{reservation['title']}",
+                        key=f"jump_reservation_month_{reservation['id']}",
+                        reservation_id=reservation["id"],
+                    )
         else:
             st.caption("今月の予約はありません。")
 
@@ -1136,17 +1210,27 @@ with home_tab:
         if incomplete_month_trips:
             for trip in incomplete_month_trips:
                 status = get_reservation_status(trip["id"])
-                st.markdown(
-                    f"**{trip['name']}**　"
-                    f"{_format_date(trip['start_date'])} 〜 {_format_date(trip['end_date'])}"
-                )
-                st.markdown(
-                    _status_line("往路", status["outbound"])
-                    + "　"
-                    + _status_line("ホテル", status["hotel"])
-                    + "　"
-                    + _status_line("復路", status["return"])
-                )
+                info_col, button_col = st.columns([4, 1])
+                with info_col:
+                    st.markdown(
+                        f"**{trip['name']}**　"
+                        f"{_format_date(trip['start_date'])} 〜 "
+                        f"{_format_date(trip['end_date'])}"
+                    )
+                    st.markdown(
+                        _status_line("往路", status["outbound"])
+                        + "　"
+                        + _status_line("ホテル", status["hotel"])
+                        + "　"
+                        + _status_line("復路", status["return"])
+                    )
+                with button_col:
+                    render_trip_jump_button(
+                        "予約を追加",
+                        trip["id"],
+                        f"確認が必要：{trip['name']}",
+                        key=f"jump_trip_attention_{trip['id']}",
+                    )
         else:
             st.caption("今月、確認が必要な出張はありません。")
 
@@ -1155,7 +1239,12 @@ with home_tab:
     if upcoming_trips:
         for trip in upcoming_trips:
             status = get_reservation_status(trip["id"])
-            trip_reservations = fetch_reservations_by_trip(trip["id"])
+            trip_reservations = safe_fetch(
+                fetch_reservations_by_trip,
+                trip["id"],
+                default=[],
+                error_message="予約データの読み込みに失敗しました。時間をおいて再度お試しください。",
+            )
 
             with st.expander(
                 f"{trip['name']}　"
@@ -1170,23 +1259,18 @@ with home_tab:
                     + _status_line("復路", status["return"])
                 )
 
+                render_trip_jump_button(
+                    "🧳 出張タブでこの出張を編集する",
+                    trip["id"],
+                    f"直近の出張：{trip['name']}",
+                    key=f"jump_trip_upcoming_{trip['id']}",
+                )
+
                 st.markdown("##### 予約一覧")
 
                 if trip_reservations:
                     for reservation in trip_reservations:
-                        icon = SERVICE_ICONS.get(
-                            reservation["reservation_service"], "📌"
-                        )
-                        status_suffix = _reservation_status_suffix(
-                            reservation["status"]
-                        )
-                        st.markdown(
-                            f"- {icon} {reservation['reservation_type']}・"
-                            f"{reservation['reservation_service']}／"
-                            f"{reservation['title']}／"
-                            f"{_reservation_period_display(reservation)}／"
-                            f"{_format_amount(reservation['amount'])}{status_suffix}"
-                        )
+                        st.markdown(format_reservation_line(reservation))
                 else:
                     st.caption("この出張にはまだ予約が登録されていません。")
 
@@ -1251,8 +1335,20 @@ with calendar_tab:
     _, last_day_num = calendar.monthrange(display_month.year, display_month.month)
     last_day_of_month = date(display_month.year, display_month.month, last_day_num)
 
-    range_trips = fetch_trips_in_range(range_start, range_end)
-    range_reservations = fetch_reservations_in_range(range_start, range_end)
+    range_trips = safe_fetch(
+        fetch_trips_in_range,
+        range_start,
+        range_end,
+        default=[],
+        error_message="出張データの読み込みに失敗しました。時間をおいて再度お試しください。",
+    )
+    range_reservations = safe_fetch(
+        fetch_reservations_in_range,
+        range_start,
+        range_end,
+        default=[],
+        error_message="予約データの読み込みに失敗しました。時間をおいて再度お試しください。",
+    )
 
     weekday_labels = ["日", "月", "火", "水", "木", "金", "土"]
     header_html = "".join(
@@ -1369,37 +1465,32 @@ with calendar_tab:
         st.caption("この日に該当する出張・予約はありません。")
 
     else:
-        for trip in day_detail_trips:
-            st.markdown(
-                f"🧳 **{trip['name']}**　"
-                f"{_format_date(trip['start_date'])} 〜 {_format_date(trip['end_date'])}"
-                f"　／　{trip['destination']}"
-            )
+        if day_detail_trips:
+            st.markdown("###### 🧳 出張")
+            for trip in day_detail_trips:
+                render_trip_card(trip)
 
-        for reservation in day_detail_reservations:
-            bar_label = _reservation_bar_label(reservation, selected_day)
+        reservation_type_labels = {
+            "往路": "🚄 往路",
+            "ホテル": "🏨 ホテル",
+            "復路": "🚄 復路",
+            "その他": "📌 その他予約",
+        }
 
-            st.markdown(
-                f"{bar_label}／{reservation['title']}／"
-                f"{_reservation_period_display(reservation)}／"
-                f"{_format_amount(reservation['amount'])}"
-            )
+        for reservation_type, section_label in reservation_type_labels.items():
+            type_reservations = [
+                reservation
+                for reservation in day_detail_reservations
+                if reservation["reservation_type"] == reservation_type
+            ]
 
-            detail_info_col, detail_link_col = st.columns([2, 1])
+            if not type_reservations:
+                continue
 
-            with detail_info_col:
-                if reservation["reservation_number"]:
-                    st.caption(f"予約番号：{reservation['reservation_number']}")
+            st.markdown(f"###### {section_label}")
 
-            with detail_link_col:
-                safe_url = _safe_reservation_url(reservation["reservation_url"])
-
-                if safe_url:
-                    st.link_button(
-                        "予約確認ページを開く",
-                        safe_url,
-                        use_container_width=True,
-                    )
+            for reservation in type_reservations:
+                render_reservation_card(reservation, context_day=selected_day)
 
     st.divider()
 
@@ -1416,11 +1507,7 @@ with calendar_tab:
 
     if month_trips:
         for trip in month_trips:
-            st.markdown(
-                f"- **{trip['name']}**　"
-                f"{_format_date(trip['start_date'])} 〜 {_format_date(trip['end_date'])}"
-                f"　／　{trip['destination']}"
-            )
+            st.markdown(format_trip_line(trip))
 
     else:
         st.caption("この月に出張はありません。")
@@ -1435,15 +1522,7 @@ with calendar_tab:
 
     if month_reservations:
         for reservation in month_reservations:
-            service = reservation["reservation_service"]
-            icon = SERVICE_ICONS.get(service, "📌")
-            status_suffix = _reservation_status_suffix(reservation["status"])
-
-            st.markdown(
-                f"- {_reservation_period_display(reservation)}　"
-                f"{icon} {reservation['reservation_type']}・{service}　"
-                f"{reservation['title']}{status_suffix}"
-            )
+            st.markdown(format_reservation_month_line(reservation))
 
     else:
         st.caption("この月に予約はありません。")
