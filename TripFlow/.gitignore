@@ -9,7 +9,10 @@ venv/
 env/
 
 # Streamlit
-.streamlit/secrets.toml
+# パターンにスラッシュを含むため、これ単体だとリポジトリルート直下の
+# .streamlit/secrets.tomlにしかマッチしない。TripFlow本体はweb/配下に
+# あるため、**/を付けてどの階層のsecrets.tomlも確実に除外する。
+**/.streamlit/secrets.toml
 
 # Database
 *.db

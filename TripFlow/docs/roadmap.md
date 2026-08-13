@@ -3,9 +3,9 @@
 ## 現在地
 
 TripFlow Desktop版 v0.6まで完成。
-Web v0.1・Web v0.2完成。
+Web v0.1・Web v0.2・Web v0.3完成。
 
-現在は、Web v0.3（Googleログイン・ユーザーごとのデータ分離）へ向けた準備段階です。
+現在は、Web v0.4（Gmail連携）へ向けた準備段階です。
 
 ---
 
@@ -97,21 +97,35 @@ Web v0.2で実際に実装した内容：
 
 # Phase 2：Googleログイン
 
-## Web v0.3
+## Web v0.3 ✅ 完了
 
 目的：
 
 利用者ごとにデータを分けられるようにする。
 
-実装予定：
+実装予定（当初計画）：
 
-- [ ] Googleログイン
-- [ ] Google OAuth
-- [ ] ユーザー情報保存
-- [ ] ユーザーごとのデータ分離
-- [ ] ログアウト
-- [ ] 認証エラー処理
-- [ ] セキュリティ設定
+- [x] Googleログイン（Streamlitネイティブ認証`st.login()`を利用）
+- [x] Google OAuth（Google OIDC、Authlib経由）
+- [x] ユーザー情報保存（`users`テーブル、`google_sub`を識別子として使用）
+- [x] ユーザーごとのデータ分離（`trips.user_id`、`reservations`はtrip_id経由で所有者判定）
+- [x] ログアウト（`st.logout()`＋TripFlow固有session_stateのクリア）
+- [x] 認証エラー処理（secrets.toml未設定時にAttributeErrorを安全にキャッチ）
+- [x] セキュリティ設定（全CRUDでの所有者チェック、session_state無効ID対策）
+
+Web v0.3で実際に実装した内容：
+
+- [x] usersテーブルの新設（`id` / `google_sub` / `email` / `display_name` / `created_at` / `updated_at`）
+- [x] trips.user_id追加、reservationsはtrip_id経由での所有者判定に統一（reservationsにuser_idは持たせない設計）
+- [x] 出張・予約の全CRUD関数（`database.py`）の所有者チェック化。更新・削除は影響行数を返し、0件は「対象が存在しないか権限が無い」として安全に扱う
+- [x] 未ログイン時にTripFlow本体（出張・予約・カレンダー）を一切表示しないログインゲート
+- [x] ログイン後ヘッダーへのユーザー表示・ログアウトボタン
+- [x] Web v0.2以前の既存データを`legacy user`へ安全に移行する仕組み（自動での他ユーザーへの割り当ては行わない）
+- [x] 実際のGoogleアカウントでのログイン確認後、legacyデータを本人ユーザーへ移行（データの削除は行わない）
+- [x] session_stateに無効なID（削除済み・他ユーザーのID）が残ってもクラッシュしないよう`clear_stale_selection()`を追加
+- [x] `Authlib`・`httpx`の依存関係追加
+- [x] `.streamlit/secrets.toml`の配置場所をリポジトリルート（`streamlit run`の作業ディレクトリ基準）に統一
+- [x] ユーザー分離・所有者チェック・回帰確認のテスト（複数ユーザーでのデータ非公開性を含む）
 
 ---
 
@@ -230,11 +244,11 @@ Gmailの予約メールから予約情報を取り込めるようにする。
 
 ---
 
-# 現在の最優先タスク（Web v0.2完了時点）
+# 現在の最優先タスク（Web v0.3完了時点）
 
 1. ~~Web版フォルダ構成の完成～GitHubへコミット~~（Web v0.1で完了）
-2. Web v0.2の内容をGitHubへコミット
-3. Web v0.3（Googleログイン）着手前の準備
-   - ログイン画面表示・ログイン後表示の切り替えを想定したapp.pyの構造整理
-   - `trips`／`reservations`テーブルへの`user_id`追加方針の検討（既存データの移行方法を含む）
-   - 簡易な自動テスト（regression test）をリポジトリに追加し、今後の変更に対する回帰検知をしやすくする
+2. Web v0.2・Web v0.3の内容をGitHubへコミット
+3. Web v0.4（Gmail連携）着手前の準備
+   - `reservations`テーブルへの`gmail_message_id`列追加方針の検討
+   - Gmail取り込み候補を一時的に保持する仕組み（確認前は自動登録しない設計。design.md参照）の検討
+   - Gmail APIに必要なOAuthスコープ追加時の、既存Googleログイン設定への影響確認

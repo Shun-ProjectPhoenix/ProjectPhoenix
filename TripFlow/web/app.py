@@ -26,6 +26,7 @@ from components import (
     _safe_reservation_url,
     _shift_month,
     _status_line,
+    clear_stale_selection,
     format_reservation_line,
     format_reservation_month_line,
     format_trip_line,
@@ -36,6 +37,7 @@ from components import (
     safe_fetch,
 )
 from database import (
+    OwnershipError,
     delete_reservation,
     delete_trip,
     fetch_reservation,
@@ -45,6 +47,7 @@ from database import (
     fetch_trips,
     fetch_trips_in_range,
     fetch_upcoming_trips,
+    get_or_create_user,
     get_reservation_status,
     init_db,
     insert_reservation,
@@ -52,6 +55,11 @@ from database import (
     update_reservation,
     update_trip,
 )
+
+# 所有者チェックに失敗した（他ユーザーのデータを操作しようとした）場合や、
+# 対象が既に削除されている場合に共通で表示するメッセージ。
+# 「他人のものだから失敗した」と推測できる情報は出さない。
+OWNERSHIP_ERROR_MESSAGE = "対象データが見つからないか、操作する権限がありません。"
 
 
 # --------------------------------------------------
@@ -349,6 +357,69 @@ today = date.today()
 
 
 # --------------------------------------------------
+# ログインゲート
+# 未ログイン状態では、TripFlow本体（出張・予約・カレンダー等の
+# データ画面）を一切表示しない。st.user.is_logged_inは
+# .streamlit/secrets.tomlに[auth]設定が無い場合AttributeErrorになる
+# ため、安全側に倒して「未ログイン」として扱う。
+# --------------------------------------------------
+def _is_logged_in() -> bool:
+    try:
+        return bool(st.user.is_logged_in)
+    except AttributeError:
+        return False
+
+
+if not _is_logged_in():
+    st.markdown(
+        """
+        <div class="tripflow-header">
+            <h1>✈️ TripFlow</h1>
+            <p>出張の予約・費用・予定を、ひとつの画面で。</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.write(
+        "出張の予約状況・費用・予定をまとめて確認できるアプリです。"
+        "利用を続けるには、Googleアカウントでログインしてください。"
+    )
+
+    if st.button("🔐 Googleでログイン", use_container_width=True):
+        st.login()
+
+    st.stop()
+
+
+# --------------------------------------------------
+# ログインユーザーの取得・登録
+# user_idは必ずGoogleの認証情報（st.user.sub）から特定する。
+# 画面からの入力やsession_stateの値だけを信用してuser_idを
+# 決めることは絶対に行わない。
+# --------------------------------------------------
+current_user = get_or_create_user(
+    google_sub=st.user.sub,
+    email=st.user.email or "",
+    display_name=st.user.name,
+)
+user_id = current_user["id"]
+display_name = current_user["display_name"] or current_user["email"] or "ゲスト"
+
+
+def _clear_tripflow_session_state() -> None:
+    """ログアウト時、TripFlow固有の一時状態を破棄する。
+
+    出張・予約の選択ID、ホームからのジャンプ先、削除確認フラグ、
+    カレンダーの選択日など、動的なキー名（出張IDや予約IDを含むもの）
+    まで含めて確実に消すため、session_state全体をクリアする。
+    Streamlit自体の認証情報はsession_stateではなく署名付きCookieで
+    管理されているため、ここでは触れず st.logout() に処理を任せる。
+    """
+    st.session_state.clear()
+
+
+# --------------------------------------------------
 # ヘッダー
 # --------------------------------------------------
 st.markdown(
@@ -360,6 +431,22 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+user_info_col, logout_col = st.columns([4, 1])
+
+with user_info_col:
+    st.markdown(f"ようこそ、**{display_name}** さん")
+
+with logout_col:
+    if st.button("ログアウト", use_container_width=True):
+        _clear_tripflow_session_state()
+        st.logout()
+        # st.logout()はリダイレクトを予約するだけで、このスクリプト実行
+        # 自体は止まらない。ここで停止しないと、クリア直後に以降のUIが
+        # そのまま再描画され、ウィジェットのkeyがsession_stateに再生成
+        # されてしまう（せっかくクリアした意味が薄れるうえ、ログアウト
+        # 完了までの一瞬、UIがちらつく）。
+        st.stop()
 
 
 # --------------------------------------------------
@@ -428,6 +515,7 @@ with trips_tab:
         else:
             try:
                 insert_trip(
+                    user_id=user_id,
                     name=trip_name.strip(),
                     start_date=start_date,
                     end_date=end_date,
@@ -444,6 +532,7 @@ with trips_tab:
 
     all_trips = safe_fetch(
         fetch_trips,
+        user_id,
         default=[],
         error_message="出張データの読み込みに失敗しました。時間をおいて再度お試しください。",
     )
@@ -478,6 +567,12 @@ with trips_tab:
         else:
             jump_reservation_id = None
 
+        # 削除やログインユーザーの切り替え等で、選択中の出張IDが
+        # もう存在しない（または自分の所有物ではない）場合、
+        # そのままだと下のselectboxのformat_funcでKeyErrorになるため、
+        # 事前に安全へクリアしておく。
+        clear_stale_selection(EDIT_TRIP_SELECT_KEY, trip_options.keys())
+
         selected_id = st.selectbox(
             "編集する出張を選択",
             options=list(trip_options.keys()),
@@ -485,7 +580,7 @@ with trips_tab:
             key=EDIT_TRIP_SELECT_KEY,
         )
 
-        selected_trip = fetch_trip(selected_id)
+        selected_trip = fetch_trip(user_id, selected_id)
 
         with st.form(f"edit_trip_form_{selected_id}"):
             edit_name = st.text_input(
@@ -549,7 +644,8 @@ with trips_tab:
 
             else:
                 try:
-                    update_trip(
+                    affected_rows = update_trip(
+                        user_id=user_id,
                         trip_id=selected_id,
                         name=edit_name.strip(),
                         start_date=edit_start_date,
@@ -563,12 +659,16 @@ with trips_tab:
                     st.error("出張の更新に失敗しました。時間をおいて再度お試しください。")
 
                 else:
-                    st.success(f"「{edit_name}」を更新しました。")
-                    all_trips = safe_fetch(
-                        fetch_trips,
-                        default=[],
-                        error_message="出張データの読み込みに失敗しました。時間をおいて再度お試しください。",
-                    )
+                    if affected_rows == 0:
+                        st.error(OWNERSHIP_ERROR_MESSAGE)
+                    else:
+                        st.success(f"「{edit_name}」を更新しました。")
+                        all_trips = safe_fetch(
+                            fetch_trips,
+                            user_id,
+                            default=[],
+                            error_message="出張データの読み込みに失敗しました。時間をおいて再度お試しください。",
+                        )
 
         confirm_key = f"confirm_delete_{selected_id}"
 
@@ -593,21 +693,25 @@ with trips_tab:
                     use_container_width=True,
                 ):
                     try:
-                        delete_trip(selected_id)
+                        affected_rows = delete_trip(user_id=user_id, trip_id=selected_id)
 
                     except sqlite3.Error:
                         st.error("出張の削除に失敗しました。時間をおいて再度お試しください。")
 
                     else:
                         st.session_state[confirm_key] = False
-                        # 削除した出張のIDがセレクトボックスの状態に残ったままだと、
-                        # 次の描画でoptionsに存在しないIDのformat_funcが呼ばれて
-                        # KeyErrorになるため、選択状態もあわせてリセットする。
-                        st.session_state.pop(EDIT_TRIP_SELECT_KEY, None)
-                        st.toast(
-                            f"「{selected_trip['name']}」を削除しました。", icon="🗑️"
-                        )
-                        st.rerun()
+
+                        if affected_rows == 0:
+                            st.error(OWNERSHIP_ERROR_MESSAGE)
+                        else:
+                            # 削除した出張のIDがセレクトボックスの状態に残ったままだと、
+                            # 次の描画でoptionsに存在しないIDのformat_funcが呼ばれて
+                            # KeyErrorになるため、選択状態もあわせてリセットする。
+                            st.session_state.pop(EDIT_TRIP_SELECT_KEY, None)
+                            st.toast(
+                                f"「{selected_trip['name']}」を削除しました。", icon="🗑️"
+                            )
+                            st.rerun()
 
             with confirm_col2:
                 if st.button(
@@ -730,6 +834,7 @@ with trips_tab:
                 try:
                     if reservation_type == "ホテル":
                         insert_reservation(
+                            user_id=user_id,
                             trip_id=selected_id,
                             reservation_type=reservation_type,
                             reservation_service=reservation_service,
@@ -746,6 +851,7 @@ with trips_tab:
 
                     else:
                         insert_reservation(
+                            user_id=user_id,
                             trip_id=selected_id,
                             reservation_type=reservation_type,
                             reservation_service=reservation_service,
@@ -758,6 +864,9 @@ with trips_tab:
                             memo=reservation_memo.strip(),
                         )
 
+                except OwnershipError:
+                    st.error(OWNERSHIP_ERROR_MESSAGE)
+
                 except sqlite3.Error:
                     st.error("予約の保存に失敗しました。時間をおいて再度お試しください。")
 
@@ -766,6 +875,7 @@ with trips_tab:
 
         reservations = safe_fetch(
             fetch_reservations_by_trip,
+            user_id,
             selected_id,
             default=[],
             error_message="予約データの読み込みに失敗しました。時間をおいて再度お試しください。",
@@ -794,6 +904,12 @@ with trips_tab:
                     jump_reservation_id
                 )
 
+            # 出張IDと同様、選択中の予約IDがもう存在しない
+            # （または自分の所有物ではない）場合に備えて事前にクリアする。
+            clear_stale_selection(
+                f"select_reservation_{selected_id}", reservation_options.keys()
+            )
+
             selected_reservation_id = st.selectbox(
                 "編集する予約を選択",
                 options=list(reservation_options.keys()),
@@ -801,7 +917,7 @@ with trips_tab:
                 key=f"select_reservation_{selected_id}",
             )
 
-            selected_reservation = fetch_reservation(selected_reservation_id)
+            selected_reservation = fetch_reservation(user_id, selected_reservation_id)
 
             # 「種類」はフォームの外に置き、ホテルを選んだ瞬間に
             # チェックイン/チェックアウト欄へ切り替わるようにする。
@@ -943,7 +1059,8 @@ with trips_tab:
                 else:
                     try:
                         if edit_reservation_type == "ホテル":
-                            update_reservation(
+                            affected_rows = update_reservation(
+                                user_id=user_id,
                                 reservation_id=selected_reservation_id,
                                 reservation_type=edit_reservation_type,
                                 reservation_service=edit_reservation_service,
@@ -959,7 +1076,8 @@ with trips_tab:
                             )
 
                         else:
-                            update_reservation(
+                            affected_rows = update_reservation(
+                                user_id=user_id,
                                 reservation_id=selected_reservation_id,
                                 reservation_type=edit_reservation_type,
                                 reservation_service=edit_reservation_service,
@@ -978,8 +1096,13 @@ with trips_tab:
                         st.error("予約の更新に失敗しました。時間をおいて再度お試しください。")
 
                     else:
-                        st.toast(f"「{edit_reservation_title}」を更新しました。", icon="✅")
-                        st.rerun()
+                        if affected_rows == 0:
+                            st.error(OWNERSHIP_ERROR_MESSAGE)
+                        else:
+                            st.toast(
+                                f"「{edit_reservation_title}」を更新しました。", icon="✅"
+                            )
+                            st.rerun()
 
             reservation_confirm_key = f"confirm_delete_reservation_{selected_reservation_id}"
 
@@ -1012,7 +1135,10 @@ with trips_tab:
                         use_container_width=True,
                     ):
                         try:
-                            delete_reservation(selected_reservation_id)
+                            affected_rows = delete_reservation(
+                                user_id=user_id,
+                                reservation_id=selected_reservation_id,
+                            )
 
                         except sqlite3.Error:
                             st.error(
@@ -1021,17 +1147,21 @@ with trips_tab:
 
                         else:
                             st.session_state[reservation_confirm_key] = False
-                            # 削除した予約のIDがセレクトボックスの状態に残ったままだと、
-                            # 次の描画でoptionsに存在しないIDのformat_funcが呼ばれて
-                            # KeyErrorになるため、選択状態もあわせてリセットする。
-                            st.session_state.pop(
-                                f"select_reservation_{selected_id}", None
-                            )
-                            st.toast(
-                                f"「{selected_reservation['title']}」を削除しました。",
-                                icon="🗑️",
-                            )
-                            st.rerun()
+
+                            if affected_rows == 0:
+                                st.error(OWNERSHIP_ERROR_MESSAGE)
+                            else:
+                                # 削除した予約のIDがセレクトボックスの状態に残ったままだと、
+                                # 次の描画でoptionsに存在しないIDのformat_funcが呼ばれて
+                                # KeyErrorになるため、選択状態もあわせてリセットする。
+                                st.session_state.pop(
+                                    f"select_reservation_{selected_id}", None
+                                )
+                                st.toast(
+                                    f"「{selected_reservation['title']}」を削除しました。",
+                                    icon="🗑️",
+                                )
+                                st.rerun()
 
                 with res_confirm_col2:
                     if st.button(
@@ -1104,7 +1234,7 @@ with trips_tab:
                     "分類": trip["category"],
                     "予約状況": (
                         "✅ 予約完了"
-                        if get_reservation_status(trip["id"])["complete"]
+                        if get_reservation_status(user_id, trip["id"])["complete"]
                         else "⚠️ 確認が必要"
                     ),
                 }
@@ -1123,6 +1253,7 @@ with trips_tab:
 with home_tab:
     upcoming_trips = safe_fetch(
         fetch_upcoming_trips,
+        user_id,
         today,
         limit=3,
         default=[],
@@ -1132,6 +1263,7 @@ with home_tab:
     this_month_start, this_month_end = _month_bounds(today)
     this_month_trips = safe_fetch(
         fetch_trips_in_range,
+        user_id,
         this_month_start,
         this_month_end,
         default=[],
@@ -1139,6 +1271,7 @@ with home_tab:
     )
     this_month_reservations = safe_fetch(
         fetch_reservations_in_range,
+        user_id,
         this_month_start,
         this_month_end,
         default=[],
@@ -1155,7 +1288,7 @@ with home_tab:
     attention_count = sum(
         1
         for trip in this_month_trips
-        if not get_reservation_status(trip["id"])["complete"]
+        if not get_reservation_status(user_id, trip["id"])["complete"]
     )
 
     st.subheader(f"{today.year}年{today.month}月")
@@ -1170,7 +1303,7 @@ with home_tab:
     incomplete_month_trips = [
         trip
         for trip in this_month_trips
-        if not get_reservation_status(trip["id"])["complete"]
+        if not get_reservation_status(user_id, trip["id"])["complete"]
     ]
 
     with st.expander(f"🧳 出張予定：{trip_count}件の内訳"):
@@ -1209,7 +1342,7 @@ with home_tab:
     with st.expander(f"⚠️ 確認が必要：{attention_count}件の内訳"):
         if incomplete_month_trips:
             for trip in incomplete_month_trips:
-                status = get_reservation_status(trip["id"])
+                status = get_reservation_status(user_id, trip["id"])
                 info_col, button_col = st.columns([4, 1])
                 with info_col:
                     st.markdown(
@@ -1238,9 +1371,10 @@ with home_tab:
 
     if upcoming_trips:
         for trip in upcoming_trips:
-            status = get_reservation_status(trip["id"])
+            status = get_reservation_status(user_id, trip["id"])
             trip_reservations = safe_fetch(
                 fetch_reservations_by_trip,
+                user_id,
                 trip["id"],
                 default=[],
                 error_message="予約データの読み込みに失敗しました。時間をおいて再度お試しください。",
@@ -1337,6 +1471,7 @@ with calendar_tab:
 
     range_trips = safe_fetch(
         fetch_trips_in_range,
+        user_id,
         range_start,
         range_end,
         default=[],
@@ -1344,6 +1479,7 @@ with calendar_tab:
     )
     range_reservations = safe_fetch(
         fetch_reservations_in_range,
+        user_id,
         range_start,
         range_end,
         default=[],

@@ -113,7 +113,7 @@ TripFlowでは、これらの情報を一つの画面にまとめます。
 
 ### Gmail連携
 
-- Googleログイン
+- ~~Googleログイン~~ → Web v0.3で実装済み（12章参照）
 - Gmailから予約メールを検索
 - 予約候補の抽出
 - 登録前の確認画面
@@ -147,11 +147,23 @@ TripFlowでは、これらの情報を一つの画面にまとめます。
 
 ## 7. データ構成
 
+### 7.0 ユーザーデータ（Web v0.3で追加）
+
+| 項目 | 説明 |
+|---|---|
+| id | ユーザーID（内部主キー） |
+| google_sub | Googleが発行する不変のユーザー識別子（OIDCの`sub`）。一意 |
+| email | メールアドレス（表示・連絡用。識別キーには使わない。12.3節参照） |
+| display_name | 表示名 |
+| created_at | 作成日時 |
+| updated_at | 更新日時 |
+
 ### 7.1 出張データ
 
 | 項目 | 説明 |
 |---|---|
 | id | 出張ID |
+| user_id | 所有者のユーザーID（Web v0.3で追加。12章参照） |
 | name | 出張名 |
 | start_date | 開始日 |
 | end_date | 終了日 |
@@ -166,15 +178,18 @@ TripFlowでは、これらの情報を一つの画面にまとめます。
 | 項目 | 説明 |
 |---|---|
 | id | 予約ID |
-| trip_id | 紐づく出張ID |
+| trip_id | 紐づく出張ID（所有者は出張のuser_id経由で判定。予約自体にuser_idは持たせない） |
 | reservation_type | 予約種別 |
+| reservation_service | 予約サービス（えきねっと／スマートEX／スカイマーク／Agoda／その他） |
 | title | 予約名 |
 | reservation_date | 利用日 |
+| check_in_date / check_out_date | ホテルのチェックイン日／チェックアウト日 |
 | amount | 金額 |
 | reservation_number | 予約番号 |
 | reservation_url | 予約確認URL |
 | status | 予約済み・未予約・キャンセル |
-| gmail_message_id | GmailメッセージID |
+| memo | メモ |
+| gmail_message_id | GmailメッセージID（Gmail連携で使用予定。**Web v0.3時点では未実装**） |
 | created_at | 作成日時 |
 | updated_at | 更新日時 |
 
@@ -224,12 +239,17 @@ Gmailから取得した情報は、自動では登録しません。
 - SQLite
 - Pandas
 
+Web v0.3で追加：
+
+- Authlib（Streamlitのネイティブ認証機能が内部で使用）
+- httpx（Streamlitの認証機能が実行時に必要とする依存ライブラリ）
+
 将来の本格版候補：
 
 - フロントエンド
 - バックエンドAPI
 - クラウドデータベース
-- Google OAuth
+- ~~Google OAuth~~ → Web v0.3で実装済み（12章参照）
 - Gmail API
 - Google Calendar API
 
@@ -250,3 +270,48 @@ Web v0.1では、次の機能を完成させます。
 - SQLiteへデータを保存できる
 
 Gmail連携はWeb v0.1には含めません。
+
+---
+
+## 12. Web v0.3の認証・ユーザー分離設計
+
+### 12.1 認証方式
+
+- **Streamlitのネイティブ認証機能**（`st.login()` / `st.logout()` / `st.user`）を採用。自前でOAuthフローを実装していない
+- プロバイダは**Google（OIDC）**の1つのみ。複数プロバイダ・複数アカウントの同時連携は行わない
+- 認証設定（`client_id` / `client_secret` / `cookie_secret` / `redirect_uri` / `server_metadata_url`）は`.streamlit/secrets.toml`に保持する
+- リダイレクトURIは`{アプリのURL}/oauth2callback`固定。ローカル開発では`http://localhost:8501/oauth2callback`
+
+### 12.2 usersテーブルとユーザー識別
+
+- `users`テーブルを新設し、Googleアカウントごとに1件のユーザー行を持つ（7.0節参照）
+- ユーザー識別子には、Googleが発行する**不変の`sub`（google_sub列）**を使用する
+- メールアドレス（email列）はGoogle Workspace等の設定変更で変わり得るため、識別キーとしては使わず、表示・連絡用の付随情報として保持するにとどめる
+- ログイン成功のたびに`google_sub`でユーザーを検索し、無ければ新規作成、あれば`email`/`display_name`を最新の値に更新する（`get_or_create_user`）
+
+### 12.3 所有者管理とCRUD時の所有者チェック
+
+- `trips`テーブルに`user_id`列を追加し、出張の所有者を直接管理する
+- `reservations`テーブルには`user_id`を**持たせない**。予約の所有者は常に`reservations.trip_id → trips.user_id`の経路のみで判定する（reservationsとtripsの2箇所に所有者情報を持たせると、同期がズレた場合に他人のデータが見える事故につながるため、所有者情報は1箇所に一本化する設計とした）
+- 出張・予約の取得・更新・削除は、すべてSQL文中のWHERE句で所有者条件（`user_id = ?`、または`trip_id IN (SELECT id FROM trips WHERE user_id = ?)`）を伴う
+- 更新・削除は影響行数（0件／1件）を返す設計とし、0件の場合はアプリ側で「対象データが見つからないか、操作する権限がありません」という共通メッセージを表示する（対象が存在しないのか、他人の所有物なのかは区別して表示しない）
+- 予約の新規登録時は、対象の`trip_id`がログインユーザーの所有物であることを事前に確認し、そうでなければ例外（`OwnershipError`）を送出する
+- user_idは常にGoogleの認証情報（`st.user.sub`）から特定したものだけを使用し、画面からの入力やsession_stateの値だけを信用して決定することはしない
+
+### 12.4 session_stateの安全性
+
+- ログアウト時は、TripFlow固有のsession_state（出張・予約の選択ID、ホームからのジャンプ先、削除確認フラグ、カレンダーの選択日など）をすべてクリアしてから`st.logout()`を呼ぶ
+- 削除やユーザー切り替え等により、セレクトボックスのsession_stateに存在しない、または他ユーザーのIDが残った場合でも、アプリがクラッシュしたり他人のデータが見えたりしないよう、有効なID一覧に無い値は事前にクリアする（`clear_stale_selection`）
+
+### 12.5 legacy userの扱い
+
+- Web v0.2以前（ユーザー概念が無かった時代）のデータは、`google_sub = 'legacy-local-data'`のプレースホルダーユーザー（legacy user）に割り当てて保持する
+- 特定のGoogleアカウントへの自動割り当ては行わない（複数アカウントでの開発・テスト時に、意図しないアカウントへ既存データが渡ってしまう事故を避けるため）
+- 実際のご本人のGoogleアカウントでログインできることを確認したうえで、legacy userのデータをそのアカウントへ移行する（`trips.user_id`の付け替えのみ。データの削除は行わない）
+
+### 12.6 secrets.tomlの役割
+
+- `.streamlit/secrets.toml`に、Google OAuthのクライアント情報・Cookie署名用の秘密文字列を保持する
+- Streamlitは`streamlit run`実行時の**作業ディレクトリ**基準で`.streamlit/secrets.toml`を探すため、TripFlowではリポジトリルート（`web/`配下ではない）に配置する
+- `.gitignore`で除外し、GitHubにはコミットしない
+- Gmail APIのトークン（アクセストークン・リフレッシュトークン）は、Web v0.3時点ではSQLiteに保存していない（Gmail連携が未実装のため不要。将来Gmail連携を実装する際に、保存方法を別途設計する）

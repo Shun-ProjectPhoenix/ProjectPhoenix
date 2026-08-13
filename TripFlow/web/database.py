@@ -6,6 +6,15 @@ from pathlib import Path
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "tripflow.db"
 
+# Web v0.2以前（ユーザー概念が無かった時代）のデータを引き継ぐための
+# プレースホルダーユーザー。実際のGoogleアカウントでログインした後、
+# 手動でこのユーザーのtripsを本物のuser_idへ付け替える想定。
+LEGACY_USER_GOOGLE_SUB = "legacy-local-data"
+
+
+class OwnershipError(Exception):
+    """指定されたリソースが、指定されたユーザーの所有物ではない場合に送出する。"""
+
 
 def get_connection() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -20,6 +29,18 @@ def init_db() -> None:
     conn = get_connection()
 
     try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                google_sub TEXT NOT NULL UNIQUE,
+                email TEXT NOT NULL,
+                display_name TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS trips (
@@ -58,20 +79,20 @@ def init_db() -> None:
             """
         )
 
-        existing_columns = {
+        reservations_columns = {
             row["name"] for row in conn.execute("PRAGMA table_info(reservations)")
         }
 
-        if "reservation_service" not in existing_columns:
+        if "reservation_service" not in reservations_columns:
             conn.execute(
                 "ALTER TABLE reservations "
                 "ADD COLUMN reservation_service TEXT NOT NULL DEFAULT 'その他'"
             )
 
-        if "check_in_date" not in existing_columns:
+        if "check_in_date" not in reservations_columns:
             conn.execute("ALTER TABLE reservations ADD COLUMN check_in_date TEXT")
 
-        if "check_out_date" not in existing_columns:
+        if "check_out_date" not in reservations_columns:
             conn.execute("ALTER TABLE reservations ADD COLUMN check_out_date TEXT")
 
         # 既存のホテル予約を安全に移行する。check_in_dateが未設定の行だけを
@@ -85,67 +106,169 @@ def init_db() -> None:
             """
         )
 
+        trips_columns = {row["name"] for row in conn.execute("PRAGMA table_info(trips)")}
+
+        if "user_id" not in trips_columns:
+            conn.execute("ALTER TABLE trips ADD COLUMN user_id INTEGER REFERENCES users(id)")
+
+        # Web v0.2以前のデータ（user_idが無い）を、legacy userへ安全に割り当てる。
+        # user_idがまだ無い行が無ければ何もしない（何度実行しても安全＝冪等）。
+        # 特定のGoogleアカウントへ自動で割り当てることはしない。
+        null_user_trip_count = conn.execute(
+            "SELECT COUNT(*) FROM trips WHERE user_id IS NULL"
+        ).fetchone()[0]
+
+        if null_user_trip_count > 0:
+            legacy_user = conn.execute(
+                "SELECT id FROM users WHERE google_sub = ?",
+                (LEGACY_USER_GOOGLE_SUB,),
+            ).fetchone()
+
+            if legacy_user is None:
+                now = datetime.now().isoformat(timespec="seconds")
+                cursor = conn.execute(
+                    """
+                    INSERT INTO users (google_sub, email, display_name, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (LEGACY_USER_GOOGLE_SUB, "", "（v0.2以前の既存データ）", now, now),
+                )
+                legacy_user_id = cursor.lastrowid
+            else:
+                legacy_user_id = legacy_user["id"]
+
+            conn.execute(
+                "UPDATE trips SET user_id = ? WHERE user_id IS NULL",
+                (legacy_user_id,),
+            )
+
         conn.commit()
     finally:
         conn.close()
 
 
-def fetch_trips_in_range(range_start: date, range_end: date) -> list[sqlite3.Row]:
+# --------------------------------------------------
+# ユーザー
+# --------------------------------------------------
+def get_or_create_user(
+    google_sub: str, email: str, display_name: str | None
+) -> sqlite3.Row:
+    """Googleログイン成功時に呼び出す。
+
+    google_subに一致するユーザーが無ければ新規作成し、あれば
+    email／display_nameを最新の値に更新して返す。
+    """
+    now = datetime.now().isoformat(timespec="seconds")
+
+    conn = get_connection()
+
+    try:
+        existing = conn.execute(
+            "SELECT * FROM users WHERE google_sub = ?", (google_sub,)
+        ).fetchone()
+
+        if existing is None:
+            cursor = conn.execute(
+                """
+                INSERT INTO users (google_sub, email, display_name, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (google_sub, email, display_name, now, now),
+            )
+            conn.commit()
+            user_id = cursor.lastrowid
+        else:
+            conn.execute(
+                """
+                UPDATE users
+                SET email = ?, display_name = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (email, display_name, now, existing["id"]),
+            )
+            conn.commit()
+            user_id = existing["id"]
+
+        return conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    finally:
+        conn.close()
+
+
+def fetch_user_by_google_sub(google_sub: str) -> sqlite3.Row | None:
+    conn = get_connection()
+
+    try:
+        return conn.execute(
+            "SELECT * FROM users WHERE google_sub = ?", (google_sub,)
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------
+# 出張
+# 読み取り・更新・削除は、必ずuser_idによる所有者条件をWHERE句に含める。
+# --------------------------------------------------
+def fetch_trips_in_range(
+    user_id: int, range_start: date, range_end: date
+) -> list[sqlite3.Row]:
     conn = get_connection()
 
     try:
         return conn.execute(
             """
             SELECT * FROM trips
-            WHERE start_date <= ? AND end_date >= ?
+            WHERE user_id = ? AND start_date <= ? AND end_date >= ?
             ORDER BY start_date ASC
             """,
-            (range_end.isoformat(), range_start.isoformat()),
+            (user_id, range_end.isoformat(), range_start.isoformat()),
         ).fetchall()
     finally:
         conn.close()
 
 
-def fetch_trips() -> list[sqlite3.Row]:
+def fetch_trips(user_id: int) -> list[sqlite3.Row]:
     conn = get_connection()
 
     try:
         return conn.execute(
-            "SELECT * FROM trips ORDER BY start_date ASC"
+            "SELECT * FROM trips WHERE user_id = ? ORDER BY start_date ASC",
+            (user_id,),
         ).fetchall()
     finally:
         conn.close()
 
 
-def fetch_upcoming_trips(today: date, limit: int = 3) -> list[sqlite3.Row]:
+def fetch_upcoming_trips(user_id: int, today: date, limit: int = 3) -> list[sqlite3.Row]:
     conn = get_connection()
 
     try:
         return conn.execute(
             """
             SELECT * FROM trips
-            WHERE end_date >= ?
+            WHERE user_id = ? AND end_date >= ?
             ORDER BY start_date ASC
             LIMIT ?
             """,
-            (today.isoformat(), limit),
+            (user_id, today.isoformat(), limit),
         ).fetchall()
     finally:
         conn.close()
 
 
-def fetch_trip(trip_id: int) -> sqlite3.Row | None:
+def fetch_trip(user_id: int, trip_id: int) -> sqlite3.Row | None:
     conn = get_connection()
 
     try:
         return conn.execute(
-            "SELECT * FROM trips WHERE id = ?", (trip_id,)
+            "SELECT * FROM trips WHERE id = ? AND user_id = ?", (trip_id, user_id)
         ).fetchone()
     finally:
         conn.close()
 
 
 def update_trip(
+    user_id: int,
     trip_id: int,
     name: str,
     start_date: date,
@@ -153,18 +276,19 @@ def update_trip(
     destination: str,
     category: str,
     memo: str,
-) -> None:
+) -> int:
+    """更新した行数を返す。0ならtrip_idが存在しないか、他ユーザーの所有物。"""
     now = datetime.now().isoformat(timespec="seconds")
 
     conn = get_connection()
 
     try:
-        conn.execute(
+        cursor = conn.execute(
             """
             UPDATE trips
             SET name = ?, start_date = ?, end_date = ?, destination = ?,
                 category = ?, memo = ?, updated_at = ?
-            WHERE id = ?
+            WHERE id = ? AND user_id = ?
             """,
             (
                 name,
@@ -175,51 +299,109 @@ def update_trip(
                 memo,
                 now,
                 trip_id,
+                user_id,
             ),
         )
         conn.commit()
+        return cursor.rowcount
     finally:
         conn.close()
 
 
-def delete_trip(trip_id: int) -> None:
+def delete_trip(user_id: int, trip_id: int) -> int:
+    """削除した行数を返す。0ならtrip_idが存在しないか、他ユーザーの所有物。"""
     conn = get_connection()
 
     try:
-        conn.execute("DELETE FROM trips WHERE id = ?", (trip_id,))
+        cursor = conn.execute(
+            "DELETE FROM trips WHERE id = ? AND user_id = ?", (trip_id, user_id)
+        )
         conn.commit()
+        return cursor.rowcount
     finally:
         conn.close()
 
 
-def fetch_reservations_by_trip(trip_id: int) -> list[sqlite3.Row]:
+def insert_trip(
+    user_id: int,
+    name: str,
+    start_date: date,
+    end_date: date,
+    destination: str,
+    category: str,
+    memo: str,
+) -> int:
+    now = datetime.now().isoformat(timespec="seconds")
+
+    conn = get_connection()
+
+    try:
+        cursor = conn.execute(
+            """
+            INSERT INTO trips (
+                user_id, name, start_date, end_date, destination,
+                category, memo, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                name,
+                start_date.isoformat(),
+                end_date.isoformat(),
+                destination,
+                category,
+                memo,
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+        return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------
+# 予約
+# reservationsテーブル自体にはuser_idを持たせない（設計方針A）。
+# 所有者判定は必ず reservations.trip_id -> trips.user_id の経路で行う。
+# --------------------------------------------------
+def fetch_reservations_by_trip(user_id: int, trip_id: int) -> list[sqlite3.Row]:
     conn = get_connection()
 
     try:
         return conn.execute(
             """
-            SELECT * FROM reservations
-            WHERE trip_id = ?
-            ORDER BY reservation_date ASC, id ASC
+            SELECT reservations.* FROM reservations
+            JOIN trips ON reservations.trip_id = trips.id
+            WHERE reservations.trip_id = ? AND trips.user_id = ?
+            ORDER BY reservations.reservation_date ASC, reservations.id ASC
             """,
-            (trip_id,),
+            (trip_id, user_id),
         ).fetchall()
     finally:
         conn.close()
 
 
-def fetch_reservation(reservation_id: int) -> sqlite3.Row | None:
+def fetch_reservation(user_id: int, reservation_id: int) -> sqlite3.Row | None:
     conn = get_connection()
 
     try:
         return conn.execute(
-            "SELECT * FROM reservations WHERE id = ?", (reservation_id,)
+            """
+            SELECT reservations.* FROM reservations
+            JOIN trips ON reservations.trip_id = trips.id
+            WHERE reservations.id = ? AND trips.user_id = ?
+            """,
+            (reservation_id, user_id),
         ).fetchone()
     finally:
         conn.close()
 
 
 def update_reservation(
+    user_id: int,
     reservation_id: int,
     reservation_type: str,
     reservation_service: str,
@@ -232,13 +414,14 @@ def update_reservation(
     memo: str,
     check_in_date: date | None = None,
     check_out_date: date | None = None,
-) -> None:
+) -> int:
+    """更新した行数を返す。0ならreservation_idが存在しないか、他ユーザーの所有物。"""
     now = datetime.now().isoformat(timespec="seconds")
 
     conn = get_connection()
 
     try:
-        conn.execute(
+        cursor = conn.execute(
             """
             UPDATE reservations
             SET reservation_type = ?, reservation_service = ?, title = ?,
@@ -246,6 +429,7 @@ def update_reservation(
                 reservation_url = ?, status = ?, memo = ?,
                 check_in_date = ?, check_out_date = ?, updated_at = ?
             WHERE id = ?
+              AND trip_id IN (SELECT id FROM trips WHERE user_id = ?)
             """,
             (
                 reservation_type,
@@ -261,45 +445,65 @@ def update_reservation(
                 check_out_date.isoformat() if check_out_date else None,
                 now,
                 reservation_id,
+                user_id,
             ),
         )
         conn.commit()
+        return cursor.rowcount
     finally:
         conn.close()
 
 
-def delete_reservation(reservation_id: int) -> None:
+def delete_reservation(user_id: int, reservation_id: int) -> int:
+    """削除した行数を返す。0ならreservation_idが存在しないか、他ユーザーの所有物。"""
     conn = get_connection()
 
     try:
-        conn.execute("DELETE FROM reservations WHERE id = ?", (reservation_id,))
+        cursor = conn.execute(
+            """
+            DELETE FROM reservations
+            WHERE id = ?
+              AND trip_id IN (SELECT id FROM trips WHERE user_id = ?)
+            """,
+            (reservation_id, user_id),
+        )
         conn.commit()
+        return cursor.rowcount
     finally:
         conn.close()
 
 
-def fetch_reservations_in_range(range_start: date, range_end: date) -> list[sqlite3.Row]:
+def fetch_reservations_in_range(
+    user_id: int, range_start: date, range_end: date
+) -> list[sqlite3.Row]:
     conn = get_connection()
 
     try:
         return conn.execute(
             """
-            SELECT * FROM reservations
-            WHERE
-                (
-                    reservation_type != 'ホテル'
-                    AND reservation_date BETWEEN ? AND ?
-                )
-                OR
-                (
-                    reservation_type = 'ホテル'
-                    AND check_in_date IS NOT NULL
-                    AND check_in_date <= ?
-                    AND (check_out_date IS NULL OR check_out_date >= ?)
-                )
-            ORDER BY reservation_date ASC, id ASC
+            SELECT reservations.* FROM reservations
+            JOIN trips ON reservations.trip_id = trips.id
+            WHERE trips.user_id = ?
+              AND (
+                  (
+                      reservations.reservation_type != 'ホテル'
+                      AND reservations.reservation_date BETWEEN ? AND ?
+                  )
+                  OR
+                  (
+                      reservations.reservation_type = 'ホテル'
+                      AND reservations.check_in_date IS NOT NULL
+                      AND reservations.check_in_date <= ?
+                      AND (
+                          reservations.check_out_date IS NULL
+                          OR reservations.check_out_date >= ?
+                      )
+                  )
+              )
+            ORDER BY reservations.reservation_date ASC, reservations.id ASC
             """,
             (
+                user_id,
                 range_start.isoformat(),
                 range_end.isoformat(),
                 range_end.isoformat(),
@@ -310,8 +514,8 @@ def fetch_reservations_in_range(range_start: date, range_end: date) -> list[sqli
         conn.close()
 
 
-def get_reservation_status(trip_id: int) -> dict:
-    reservations = fetch_reservations_by_trip(trip_id)
+def get_reservation_status(user_id: int, trip_id: int) -> dict:
+    reservations = fetch_reservations_by_trip(user_id, trip_id)
 
     def _is_confirmed(reservation_type: str) -> bool:
         return any(
@@ -333,6 +537,7 @@ def get_reservation_status(trip_id: int) -> dict:
 
 
 def insert_reservation(
+    user_id: int,
     trip_id: int,
     reservation_type: str,
     reservation_service: str,
@@ -346,11 +551,21 @@ def insert_reservation(
     check_in_date: date | None = None,
     check_out_date: date | None = None,
 ) -> int:
+    """予約を登録する。trip_idがuser_idの所有物でない場合はOwnershipErrorを送出する。"""
     now = datetime.now().isoformat(timespec="seconds")
 
     conn = get_connection()
 
     try:
+        owned_trip = conn.execute(
+            "SELECT id FROM trips WHERE id = ? AND user_id = ?", (trip_id, user_id)
+        ).fetchone()
+
+        if owned_trip is None:
+            raise OwnershipError(
+                f"trip_id={trip_id} is not owned by user_id={user_id}"
+            )
+
         cursor = conn.execute(
             """
             INSERT INTO reservations (
@@ -374,44 +589,6 @@ def insert_reservation(
                 memo,
                 check_in_date.isoformat() if check_in_date else None,
                 check_out_date.isoformat() if check_out_date else None,
-                now,
-                now,
-            ),
-        )
-        conn.commit()
-        return cursor.lastrowid
-    finally:
-        conn.close()
-
-
-def insert_trip(
-    name: str,
-    start_date: date,
-    end_date: date,
-    destination: str,
-    category: str,
-    memo: str,
-) -> int:
-    now = datetime.now().isoformat(timespec="seconds")
-
-    conn = get_connection()
-
-    try:
-        cursor = conn.execute(
-            """
-            INSERT INTO trips (
-                name, start_date, end_date, destination,
-                category, memo, created_at, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                name,
-                start_date.isoformat(),
-                end_date.isoformat(),
-                destination,
-                category,
-                memo,
                 now,
                 now,
             ),

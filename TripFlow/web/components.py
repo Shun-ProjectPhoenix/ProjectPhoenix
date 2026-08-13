@@ -11,7 +11,7 @@ from __future__ import annotations
 import html
 import sqlite3
 from datetime import date
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 from urllib.parse import urlsplit
 
 import streamlit as st
@@ -360,6 +360,22 @@ def render_trip_jump_button(
     if st.button(label, key=key, use_container_width=True):
         request_trip_jump(trip_id, source_label, reservation_id=reservation_id)
         st.rerun()
+
+
+def clear_stale_selection(key: str, valid_ids: Iterable[int]) -> None:
+    """session_state[key]が、現在有効なID一覧に含まれていなければクリアする。
+
+    出張・予約の選択用セレクトボックス（st.selectbox）は、session_state
+    に保持された値をもとに表示を組み立てる際、format_funcへその値を渡す。
+    削除やユーザー切り替え等により、その値がもう存在しない（または
+    ログインユーザーの所有物ではない）IDになっていると、format_func内の
+    辞書参照でKeyErrorになりアプリがクラッシュする。ここで事前にクリア
+    しておくことで、セレクトボックスは安全に先頭の選択肢（未選択相当）
+    へフォールバックする。「他人のデータが存在する」ことを示すメッセージ
+    は一切出さない。
+    """
+    if key in st.session_state and st.session_state[key] not in valid_ids:
+        del st.session_state[key]
 
 
 # --------------------------------------------------
