@@ -8,6 +8,7 @@ from datetime import date, timedelta
 import pandas as pd
 import streamlit as st
 
+import gmail_service
 from components import (
     CATEGORY_OPTIONS,
     EDIT_TRIP_SELECT_KEY,
@@ -419,6 +420,121 @@ def _clear_tripflow_session_state() -> None:
     st.session_state.clear()
 
 
+def _gmail_access_available() -> bool:
+    """Gmail API用のaccess tokenを取得できるかどうかだけを判定する。
+
+    Web v0.4 Phase A時点ではGmail APIを実際には呼び出さない。
+    token本体は変数にも画面にもログにも一切残さず、真偽値のみを返す。
+    secrets.tomlにexpose_tokensが未設定、またはaccess tokenが
+    失効している場合はAttributeError/Noneになるため、安全側に倒して
+    「利用不可（再ログインが必要）」として扱う。
+    """
+    try:
+        return bool(st.user.tokens.access)
+    except AttributeError:
+        return False
+
+
+# --------------------------------------------------
+# Web v0.4 Phase B: Gmailから予約メール候補を検索・一覧表示する。
+# 本文の本格解析・予約登録・DB保存はまだ行わない（候補の検索・一覧表示まで）。
+# --------------------------------------------------
+GMAIL_SEARCH_SERVICE_OPTIONS = ["えきねっと", "Agoda", "両方"]
+GMAIL_SEARCH_PERIOD_OPTIONS = [1, 3, 6, 12]
+GMAIL_CANDIDATES_SESSION_KEY = "tripflow_gmail_candidates"
+GMAIL_SEARCH_ERROR_SESSION_KEY = "tripflow_gmail_search_error"
+
+
+def _gmail_selected_services(choice: str) -> list[str]:
+    if choice == "両方":
+        return list(gmail_service.SUPPORTED_SERVICES)
+    return [choice]
+
+
+def _render_gmail_search_section() -> None:
+    """Gmail検索フォームと候補一覧を描画する。
+
+    access tokenはこの関数のローカル変数（関数呼び出しの引数）としてのみ
+    扱い、session_stateやログ・画面には一切出さない。session_stateへ
+    保存するのは、検索結果（件名・送信元・受信日時・snippetのみを持つ
+    候補オブジェクト）とエラーメッセージ文字列だけであり、本文全文や
+    access tokenは保持しない。ログアウト時は既存の
+    _clear_tripflow_session_state()（session_state.clear()）で
+    まとめて破棄される。
+    """
+    if not _gmail_access_available():
+        st.caption("📧 Gmail連携：再ログインが必要です")
+        st.info(
+            "Gmailから予約を検索するには、一度ログアウトしてから"
+            "再度ログインしてください。"
+        )
+        return
+
+    st.caption("📧 Gmail連携：利用可能")
+
+    service_choice = st.radio(
+        "対象サービス",
+        GMAIL_SEARCH_SERVICE_OPTIONS,
+        horizontal=True,
+        key="gmail_search_service_choice",
+    )
+    period_months = st.selectbox(
+        "検索期間",
+        GMAIL_SEARCH_PERIOD_OPTIONS,
+        index=1,
+        format_func=lambda m: f"直近{m}か月",
+        key="gmail_search_period_months",
+    )
+
+    if st.button("Gmailから検索", key="gmail_search_button"):
+        selected_services = _gmail_selected_services(service_choice)
+        with st.spinner("Gmailを検索しています..."):
+            try:
+                candidates = gmail_service.search_reservation_candidates(
+                    st.user.tokens.access,
+                    selected_services,
+                    months=period_months,
+                )
+            except gmail_service.GmailAPIError as e:
+                st.session_state[GMAIL_SEARCH_ERROR_SESSION_KEY] = e.user_message
+                st.session_state.pop(GMAIL_CANDIDATES_SESSION_KEY, None)
+            except AttributeError:
+                # 検索ボタンを押した瞬間にaccess tokenが失効していた場合。
+                st.session_state[GMAIL_SEARCH_ERROR_SESSION_KEY] = (
+                    "Gmail連携の認証期限が切れました。"
+                    "ログアウト後、再ログインしてください。"
+                )
+                st.session_state.pop(GMAIL_CANDIDATES_SESSION_KEY, None)
+            except Exception:
+                st.session_state[GMAIL_SEARCH_ERROR_SESSION_KEY] = (
+                    "予期しないエラーによりGmail検索に失敗しました。"
+                    "時間をおいて再度お試しください。"
+                )
+                st.session_state.pop(GMAIL_CANDIDATES_SESSION_KEY, None)
+            else:
+                st.session_state[GMAIL_CANDIDATES_SESSION_KEY] = candidates
+                st.session_state.pop(GMAIL_SEARCH_ERROR_SESSION_KEY, None)
+
+    search_error = st.session_state.get(GMAIL_SEARCH_ERROR_SESSION_KEY)
+    if search_error:
+        st.error(search_error)
+
+    candidates = st.session_state.get(GMAIL_CANDIDATES_SESSION_KEY)
+    if candidates is not None:
+        st.write(f"候補：{len(candidates)}件")
+
+        if not candidates:
+            st.caption("条件に一致するメールが見つかりませんでした。")
+        else:
+            for candidate in candidates:
+                with st.container(border=True):
+                    st.markdown(f"**{candidate.subject}**")
+                    st.caption(f"{candidate.service}｜{candidate.received_at}")
+                    st.caption(candidate.sender)
+                    if candidate.snippet:
+                        st.write(candidate.snippet)
+
+
 # --------------------------------------------------
 # ヘッダー
 # --------------------------------------------------
@@ -463,6 +579,11 @@ home_tab, trips_tab, calendar_tab = st.tabs(
 # 先に処理し、登録結果をホーム画面の集計にも反映させます。
 # --------------------------------------------------
 with trips_tab:
+    # Web v0.4 Phase B: メール検索・候補一覧表示まで。
+    # 本文の本格解析・予約登録・DB保存はまだ行わない（Phase C以降）。
+    with st.expander("📧 Gmailから予約を探す", expanded=False):
+        _render_gmail_search_section()
+
     st.subheader("出張を登録")
 
     with st.form("trip_form"):
