@@ -423,5 +423,103 @@ class ExistingReservationCrudUnaffectedTests(_TempDatabaseTestCase):
             )
 
 
+class GmailInsertReservationTests(_TempDatabaseTestCase):
+    """Phase E-2Bで追加したinsert_reservation()のGmail由来引数を検証する。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        db.init_db()
+        self.user = db.get_or_create_user(
+            google_sub="gmail-insert-test-sub",
+            email="gmail-insert-test@example.invalid",
+            display_name="Gmail登録テストユーザー",
+        )
+        self.trip_id = db.insert_trip(
+            user_id=self.user["id"],
+            name="Gmail登録テスト出張",
+            start_date=date(2026, 9, 1),
+            end_date=date(2026, 9, 5),
+            destination="テスト行き先",
+            category="業務",
+            memo="",
+        )
+
+    def test_gmail_origin_reservation_saves_gmail_metadata(self) -> None:
+        reservation_id = db.insert_reservation(
+            user_id=self.user["id"],
+            trip_id=self.trip_id,
+            reservation_type="往路",
+            reservation_service="えきねっと",
+            title="のぞみ1号 東京→新大阪",
+            reservation_date=date(2026, 9, 1),
+            amount=13000,
+            reservation_number="REF-0001",
+            reservation_url="",
+            status="予約済み",
+            memo="出発：東京\n到着：新大阪",
+            gmail_message_id="MSG-GMAIL-001",
+            gmail_thread_id="THREAD-GMAIL-001",
+            source_type="gmail",
+        )
+
+        reservation = db.fetch_reservation(self.user["id"], reservation_id)
+
+        self.assertEqual(reservation["source_type"], "gmail")
+        self.assertEqual(reservation["gmail_message_id"], "MSG-GMAIL-001")
+        self.assertEqual(reservation["gmail_thread_id"], "THREAD-GMAIL-001")
+        # reservation_keyはPhase E-2Bでは生成しないため、常にNULLのまま。
+        self.assertIsNone(reservation["reservation_key"])
+
+    def test_manual_reservation_without_new_kwargs_is_unaffected(self) -> None:
+        # 新しいキーワード引数を一切渡さない、既存の手動登録と同じ呼び出し方。
+        # Phase E-1と同じ結果（source_type='manual'・Gmail関連列NULL）に
+        # なることを、insert_reservation()のシグネチャ変更後にも確認する。
+        reservation_id = db.insert_reservation(
+            user_id=self.user["id"],
+            trip_id=self.trip_id,
+            reservation_type="往路",
+            reservation_service="えきねっと",
+            title="手動登録テスト予約",
+            reservation_date=date(2026, 9, 2),
+            amount=5000,
+            reservation_number="MANUAL-001",
+            reservation_url="",
+            status="予約済み",
+            memo="",
+        )
+
+        reservation = db.fetch_reservation(self.user["id"], reservation_id)
+
+        self.assertEqual(reservation["source_type"], "manual")
+        self.assertIsNone(reservation["gmail_message_id"])
+        self.assertIsNone(reservation["gmail_thread_id"])
+        self.assertIsNone(reservation["reservation_key"])
+
+    def test_hotel_manual_registration_with_check_in_out_still_works(self) -> None:
+        # ホテル予約（check_in_date/check_out_dateを使う既存の呼び出し方）が、
+        # シグネチャ変更後も位置引数の並びを変えずに動作することを確認する。
+        reservation_id = db.insert_reservation(
+            user_id=self.user["id"],
+            trip_id=self.trip_id,
+            reservation_type="ホテル",
+            reservation_service="Agoda",
+            title="手動登録テストホテル",
+            reservation_date=date(2026, 9, 3),
+            amount=8000,
+            reservation_number="",
+            reservation_url="",
+            status="予約済み",
+            memo="",
+            check_in_date=date(2026, 9, 3),
+            check_out_date=date(2026, 9, 4),
+        )
+
+        reservation = db.fetch_reservation(self.user["id"], reservation_id)
+
+        self.assertEqual(reservation["check_in_date"], "2026-09-03")
+        self.assertEqual(reservation["check_out_date"], "2026-09-04")
+        self.assertEqual(reservation["source_type"], "manual")
+
+
 if __name__ == "__main__":
     unittest.main()

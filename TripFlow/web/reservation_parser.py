@@ -14,7 +14,7 @@ design.md 13章で定めた予約関連項目（乗車日・出発時刻・到�
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 
 # --------------------------------------------------
@@ -192,6 +192,18 @@ def can_analyze(relevance: str) -> bool:
     return relevance != RELEVANCE_EXCLUDED
 
 
+def can_register(relevance: str) -> bool:
+    """「TripFlowに登録」ボタンを表示してよい分類かどうか（Phase E-2B）。
+
+    can_analyze()とは別の、より厳しい判定。予約情報抽出対象(TARGET)と
+    判定されたメールのみを登録対象とする。予約補完メール(SUPPLEMENTARY)・
+    判定不能(UNKNOWN)は、単独では登録候補にせず、従来通り手動解析のみ
+    許可する（can_analyze()の挙動は変更しない）。対象外(EXCLUDED)は
+    そもそも本文解析自体を行わないため、登録候補にもなり得ない。
+    """
+    return relevance == RELEVANCE_TARGET
+
+
 # --------------------------------------------------
 # 本文テキストの正規化（multipart / text/plain / text/html対応）
 # --------------------------------------------------
@@ -285,6 +297,11 @@ class ReservationCandidate:
     # 参照）。実際の運賃種別名を列挙して判定する実装にはしない。
     fare_type: str | None = None
     missing_fields: tuple[str, ...] = ()
+    # GmailMessageCandidate.thread_idから伝播するスレッドID（Phase E-2B）。
+    # 既存フィールドの意味・順番を変えないよう末尾にデフォルト値ありで
+    # 追加した。analyze_email()がthread_id引数を受け取った場合のみ設定され、
+    # 従来通りthread_idを渡さない呼び出しはNoneのままで変わらない。
+    thread_id: str | None = None
 
 
 # --------------------------------------------------
@@ -1310,22 +1327,101 @@ def analyze_email(
     text_plain: str,
     text_html: str,
     snippet: str = "",
+    thread_id: str | None = None,
 ) -> ReservationCandidate:
     """本文テキスト（plain/html）から登録候補を抽出する。サービスごとに処理を振り分ける。
 
     snippetは省略可能（Phase Bの候補一覧取得時点で既に取得済みのGmail生成の
     短い抜粋）。Agodaのホテル名抽出で、本文・件名から取得できなかった場合の
     最後の手がかりとしてのみ使う。
+
+    thread_idも省略可能（Phase E-2B。GmailMessageCandidate.thread_idを
+    そのまま渡す想定）。各extract_*()関数自体は変更せず、結果の
+    ReservationCandidateへdataclasses.replace()でthread_idだけを
+    後付けする形にすることで、既存の抽出ロジック・既存の呼び出し
+    （thread_idを渡さない呼び出し）には一切影響しない。
     """
     body_text = resolve_body_text(text_plain, text_html)
 
     if service == "えきねっと":
-        return extract_ekinet(message_id, relevance, subject, body_text)
-    if service == "スマートEX":
-        return extract_smart_ex(message_id, relevance, subject, body_text)
-    if service == "Agoda":
-        return extract_agoda(message_id, relevance, subject, body_text, snippet=snippet)
-    if service == "スカイマーク":
-        return extract_skymark(message_id, relevance, subject, body_text)
+        candidate = extract_ekinet(message_id, relevance, subject, body_text)
+    elif service == "スマートEX":
+        candidate = extract_smart_ex(message_id, relevance, subject, body_text)
+    elif service == "Agoda":
+        candidate = extract_agoda(message_id, relevance, subject, body_text, snippet=snippet)
+    elif service == "スカイマーク":
+        candidate = extract_skymark(message_id, relevance, subject, body_text)
+    else:
+        raise ValueError(f"未対応のサービスです: {service}")
 
-    raise ValueError(f"未対応のサービスです: {service}")
+    if thread_id:
+        candidate = replace(candidate, thread_id=thread_id)
+
+    return candidate
+
+
+# --------------------------------------------------
+# 登録内容（title / memo）の組み立て（Phase E-2B）
+#
+# reservationsテーブルには、origin/destination/start_time/end_time/
+# train_name/flight_number/car_number/seat_number/fare_typeに対応する
+# 専用列がまだ無い（claude_report.md「Phase E-2A」参照）。今回はDB列を
+# 追加せず、これらの情報をtitle（区間つきの短い予約名）とmemo（固定
+# ラベル形式の一覧）へ変換して保存する。メールに存在しない値を推測で
+# 補うことはしない（値がNoneの項目はtitle/memoのいずれからも省略する）。
+# --------------------------------------------------
+def build_reservation_title(candidate: ReservationCandidate) -> str | None:
+    """登録候補から、TripFlow予約の「予約名」を組み立てる。
+
+    えきねっと/スマートEX：列車名 + 区間（例：「のぞみ1号 東京→新大阪」）
+    スカイマーク：便名 + 区間（例：「SKY123便 羽田→福岡」）
+    Agoda：ホテル名のみ
+
+    区間（origin/destination）が無ければ列車名/便名のみを使い、
+    列車名/便名自体も無ければ、既存のcandidate.title
+    （件名等へのフォールバックを含む、extract_*()側で既に組み立て済みの値）
+    をそのまま使う。
+    """
+    if candidate.service in ("えきねっと", "スマートEX"):
+        name = candidate.train_name
+    elif candidate.service == "スカイマーク":
+        name = candidate.flight_number
+    elif candidate.service == "Agoda":
+        return candidate.hotel_name or candidate.title
+    else:
+        return candidate.title
+
+    if name and candidate.origin and candidate.destination:
+        return f"{name} {candidate.origin}→{candidate.destination}"
+    if name:
+        return name
+    return candidate.title
+
+
+def build_reservation_memo(candidate: ReservationCandidate) -> str:
+    """登録候補から、DBに専用列が無い情報をmemoへ整形する。
+
+    1行1項目・固定ラベル・固定順序とし、値がNoneの項目は行ごと省略する。
+    自由文章は混在させない（将来DB列を追加した際に、可能な範囲で機械的に
+    読み取れる形式を保つため）。
+    """
+    lines: list[str] = []
+
+    if candidate.origin:
+        lines.append(f"出発：{candidate.origin}")
+    if candidate.destination:
+        lines.append(f"到着：{candidate.destination}")
+    if candidate.start_time and candidate.end_time:
+        lines.append(f"時刻：{candidate.start_time} → {candidate.end_time}")
+    if candidate.train_name:
+        lines.append(f"列車：{candidate.train_name}")
+    if candidate.flight_number:
+        lines.append(f"便名：{candidate.flight_number}")
+    if candidate.car_number:
+        lines.append(f"号車：{candidate.car_number}")
+    if candidate.seat_number:
+        lines.append(f"座席：{candidate.seat_number}")
+    if candidate.fare_type:
+        lines.append(f"運賃種別：{candidate.fare_type}")
+
+    return "\n".join(lines)

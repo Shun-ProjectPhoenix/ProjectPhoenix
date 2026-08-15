@@ -576,8 +576,20 @@ def insert_reservation(
     memo: str,
     check_in_date: date | None = None,
     check_out_date: date | None = None,
+    *,
+    gmail_message_id: str | None = None,
+    gmail_thread_id: str | None = None,
+    source_type: str = "manual",
+    reservation_key: str | None = None,
 ) -> int:
-    """予約を登録する。trip_idがuser_idの所有物でない場合はOwnershipErrorを送出する。"""
+    """予約を登録する。trip_idがuser_idの所有物でない場合はOwnershipErrorを送出する。
+
+    gmail_message_id・gmail_thread_id・source_type・reservation_keyは
+    Phase E-2Bで追加したキーワード専用引数（Phase E-1で追加済みの4列に
+    対応）。既存の手動登録の呼び出し（これらを指定しない呼び出し）は、
+    従来通りsource_type='manual'・他3列NULLのまま動作し、挙動は変わらない。
+    reservation_keyはPhase E-2Bでは生成しないため、常にNoneを渡す想定。
+    """
     now = datetime.now().isoformat(timespec="seconds")
 
     conn = get_connection()
@@ -598,9 +610,10 @@ def insert_reservation(
                 trip_id, reservation_type, reservation_service, title,
                 reservation_date, amount, reservation_number, reservation_url,
                 status, memo, check_in_date, check_out_date,
+                gmail_message_id, gmail_thread_id, source_type, reservation_key,
                 created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 trip_id,
@@ -615,6 +628,10 @@ def insert_reservation(
                 memo,
                 check_in_date.isoformat() if check_in_date else None,
                 check_out_date.isoformat() if check_out_date else None,
+                gmail_message_id,
+                gmail_thread_id,
+                source_type,
+                reservation_key,
                 now,
                 now,
             ),

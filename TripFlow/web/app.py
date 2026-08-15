@@ -454,6 +454,21 @@ GMAIL_SEARCH_ERROR_SESSION_KEY = "tripflow_gmail_search_error"
 GMAIL_ANALYSIS_RESULTS_SESSION_KEY = "tripflow_gmail_analysis_results"
 GMAIL_ANALYSIS_ERROR_SESSION_KEY = "tripflow_gmail_analysis_errors"
 
+# Web v0.4 Phase E-2B: 「TripFlowに登録」ボタンで実際にDBへ保存した
+# message_idを記録する（message_id → 保存したreservation_idの辞書）。
+# これはUI上の二重クリック防止のみが目的で、DB側の本格的な重複防止
+# （gmail_message_idの照合等）はPhase E-3以降で扱う。ログアウト時は
+# 既存の_clear_tripflow_session_state()（session_state.clear()）で
+# まとめて破棄される。
+GMAIL_REGISTERED_SESSION_KEY = "tripflow_gmail_registered_reservations"
+
+# Gmailから登録する電車/飛行機予約について、往路/復路を自動推測せず
+# ユーザーに選ばせるための選択肢。RESERVATION_TYPE_OPTIONS（"ホテル"を
+# 含む）とは別に、交通予約用としてホテルを除いたものを用意する
+# （ホテルはcandidate.reservation_typeから機械的に"ホテル"へ固定する
+# ため、ここでは選ばせない）。
+GMAIL_REGISTRATION_TRANSIT_TYPE_OPTIONS = ["往路", "復路", "その他"]
+
 _RELEVANCE_BADGES = {
     reservation_parser.RELEVANCE_TARGET: "🟢 予約情報抽出対象",
     reservation_parser.RELEVANCE_SUPPLEMENTARY: "🔵 予約補完メール（座席等の追加情報を含む可能性）",
@@ -468,7 +483,165 @@ def _gmail_selected_services(choice: str) -> list[str]:
     return [choice]
 
 
-def _render_gmail_search_section() -> None:
+def _render_gmail_registration_controls(
+    user_id: int,
+    all_trips: list,
+    candidate,
+    registered_map: dict,
+) -> None:
+    """登録可能（TARGET）と判定された候補について、登録先出張の選択・
+    登録前の内容確認・「TripFlowに登録」ボタンを表示する（Phase E-2B）。
+
+    自動登録は行わない。ボタンが押された場合にのみinsert_reservation()を
+    呼び出す。既にこのセッション内で登録済みのmessage_idについては、
+    ボタンの代わりに登録済み表示のみを行う（同一セッション内の二重
+    クリック防止が目的で、DB側の重複防止ではない。DB側の本格的な
+    重複防止はPhase E-3以降で検討する）。
+    """
+    if candidate.message_id in registered_map:
+        st.success("✅ 登録済み")
+        return
+
+    if not all_trips:
+        st.info("この予約を登録するには、先に出張を登録してください。")
+        return
+
+    is_hotel = candidate.reservation_type == "ホテル"
+    registration_date = candidate.checkin_date if is_hotel else candidate.date
+
+    if registration_date is None:
+        st.warning("日付情報を取得できなかったため、この候補は登録できません。")
+        return
+
+    trip_options = {
+        trip["id"]: (
+            f"{trip['name']}"
+            f"（{_format_date(trip['start_date'])}"
+            f"〜{_format_date(trip['end_date'])}）"
+        )
+        for trip in all_trips
+    }
+    trip_id_list = list(trip_options.keys())
+
+    matching_trip_ids = [
+        trip["id"]
+        for trip in all_trips
+        if date.fromisoformat(trip["start_date"])
+        <= registration_date
+        <= date.fromisoformat(trip["end_date"])
+    ]
+
+    default_index = 0
+    if len(matching_trip_ids) == 1:
+        default_index = trip_id_list.index(matching_trip_ids[0])
+
+    selected_trip_id = st.selectbox(
+        "登録先の出張",
+        options=trip_id_list,
+        format_func=lambda trip_id: trip_options[trip_id],
+        index=default_index,
+        key=f"gmail_register_trip_{candidate.message_id}",
+    )
+
+    if is_hotel:
+        selected_reservation_type = "ホテル"
+        st.caption("予約種別：ホテル")
+    else:
+        selected_reservation_type = st.selectbox(
+            "予約種別",
+            GMAIL_REGISTRATION_TRANSIT_TYPE_OPTIONS,
+            key=f"gmail_register_type_{candidate.message_id}",
+        )
+
+    title = reservation_parser.build_reservation_title(candidate) or "（予約名未設定）"
+    memo = reservation_parser.build_reservation_memo(candidate)
+
+    st.markdown("##### 登録内容の確認")
+
+    confirm_fields: list[tuple[str, str]] = [
+        ("登録先出張", trip_options[selected_trip_id]),
+        ("予約種別", selected_reservation_type),
+        ("サービス", candidate.service),
+        ("タイトル", title),
+    ]
+
+    if is_hotel:
+        if candidate.checkin_date:
+            confirm_fields.append(
+                ("チェックイン", _format_date(candidate.checkin_date.isoformat()))
+            )
+        if candidate.checkout_date:
+            confirm_fields.append(
+                ("チェックアウト", _format_date(candidate.checkout_date.isoformat()))
+            )
+        if candidate.hotel_name:
+            confirm_fields.append(("ホテル名", candidate.hotel_name))
+    else:
+        if candidate.date:
+            confirm_fields.append(("日付", _format_date(candidate.date.isoformat())))
+        if candidate.origin and candidate.destination:
+            confirm_fields.append(
+                ("区間", f"{candidate.origin} → {candidate.destination}")
+            )
+        if candidate.start_time and candidate.end_time:
+            confirm_fields.append(
+                ("時刻", f"{candidate.start_time} → {candidate.end_time}")
+            )
+        if candidate.train_name:
+            confirm_fields.append(("列車", candidate.train_name))
+        if candidate.flight_number:
+            confirm_fields.append(("便名", candidate.flight_number))
+        if candidate.car_number:
+            confirm_fields.append(("号車", candidate.car_number))
+        if candidate.seat_number:
+            confirm_fields.append(("座席", candidate.seat_number))
+
+    if candidate.amount is not None:
+        confirm_fields.append(("料金", _format_amount(candidate.amount)))
+    if candidate.reservation_reference:
+        confirm_fields.append(("予約/申込番号", candidate.reservation_reference))
+
+    for label, value in confirm_fields:
+        st.caption(f"{label}：{value}")
+
+    if st.button(
+        "📌 TripFlowに登録",
+        key=f"gmail_register_button_{candidate.message_id}",
+        use_container_width=True,
+    ):
+        try:
+            reservation_id = insert_reservation(
+                user_id=user_id,
+                trip_id=selected_trip_id,
+                reservation_type=selected_reservation_type,
+                reservation_service=candidate.service,
+                title=title,
+                reservation_date=registration_date,
+                amount=candidate.amount if candidate.amount is not None else 0,
+                reservation_number=candidate.reservation_reference or "",
+                reservation_url="",
+                status="予約済み",
+                memo=memo,
+                check_in_date=candidate.checkin_date if is_hotel else None,
+                check_out_date=candidate.checkout_date if is_hotel else None,
+                gmail_message_id=candidate.message_id,
+                gmail_thread_id=candidate.thread_id,
+                source_type="gmail",
+            )
+
+        except OwnershipError:
+            st.error(OWNERSHIP_ERROR_MESSAGE)
+
+        except sqlite3.Error:
+            st.error("予約の保存に失敗しました。時間をおいて再度お試しください。")
+
+        else:
+            registered_map[candidate.message_id] = reservation_id
+            st.toast(f"「{title}」をTripFlowへ登録しました。", icon="✅")
+            st.rerun()
+
+
+def _render_gmail_search_section(user_id: int, all_trips: list) -> None:
     """Gmail検索フォームと候補一覧を描画する。
 
     access tokenはこの関数のローカル変数（関数呼び出しの引数）としてのみ
@@ -552,6 +725,9 @@ def _render_gmail_search_section() -> None:
             analysis_errors = st.session_state.setdefault(
                 GMAIL_ANALYSIS_ERROR_SESSION_KEY, {}
             )
+            registered_map = st.session_state.setdefault(
+                GMAIL_REGISTERED_SESSION_KEY, {}
+            )
 
             for candidate in candidates:
                 relevance = reservation_parser.classify_candidate(
@@ -608,6 +784,7 @@ def _render_gmail_search_section() -> None:
                                             text_plain=body.text_plain,
                                             text_html=body.text_html,
                                             snippet=candidate.snippet,
+                                            thread_id=candidate.thread_id,
                                         )
                                     except Exception:
                                         analysis_errors[candidate.message_id] = (
@@ -628,9 +805,13 @@ def _render_gmail_search_section() -> None:
                         st.error(analysis_errors[candidate.message_id])
 
                     if candidate.message_id in analysis_results:
-                        render_registration_candidate_card(
-                            analysis_results[candidate.message_id]
-                        )
+                        result = analysis_results[candidate.message_id]
+                        render_registration_candidate_card(result)
+
+                        if reservation_parser.can_register(result.relevance):
+                            _render_gmail_registration_controls(
+                                user_id, all_trips, result, registered_map
+                            )
 
 
 # --------------------------------------------------
@@ -677,10 +858,20 @@ home_tab, trips_tab, calendar_tab = st.tabs(
 # 先に処理し、登録結果をホーム画面の集計にも反映させます。
 # --------------------------------------------------
 with trips_tab:
-    # Web v0.4 Phase B: メール検索・候補一覧表示まで。
-    # 本文の本格解析・予約登録・DB保存はまだ行わない（Phase C以降）。
+    # Web v0.4 Phase E-2B: メール検索・候補一覧表示・登録先出張の選択・
+    # 「TripFlowに登録」ボタンによるDB保存まで。登録先出張の選択に
+    # 使うため、出張一覧をこのセクションより前で取得しておく（下の
+    # 「出張の編集・削除」用のall_tripsとは別に取得する。新規出張を
+    # 直後に登録した場合の反映タイミングを既存の「出張の編集・削除」
+    # セクションと変えないため、あえて2箇所で独立して取得している）。
     with st.expander("📧 Gmailから予約を探す", expanded=False):
-        _render_gmail_search_section()
+        gmail_section_trips = safe_fetch(
+            fetch_trips,
+            user_id,
+            default=[],
+            error_message="出張データの読み込みに失敗しました。時間をおいて再度お試しください。",
+        )
+        _render_gmail_search_section(user_id, gmail_section_trips)
 
     st.subheader("出張を登録")
 
