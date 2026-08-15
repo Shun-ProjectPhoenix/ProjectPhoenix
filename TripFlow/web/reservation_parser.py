@@ -122,10 +122,35 @@ SUBJECT_CLASSIFICATION_RULES: dict[str, list[ClassificationRule]] = {
             ("新幹線予約内容", "申込", "予約確認", "ご予約内容", "予約完了", "購入完了"),
         ),
     ],
+    # Web v0.4 Phase D後半：スカイマークの実機確認で、以下の件名種別が
+    # 存在することを確認できた（design.md参照）。
+    # ・「座席指定完了のご案内」：えきねっと「座席番号のご案内」・スマートEX
+    #   「乗車用ICカード指定内容」と同じ位置づけの予約補完メールと判断し、
+    #   「座席指定完了」をSUPPLEMENTARYキーワードとした
+    # ・「カード決済完了【購入済】」「確認メール【お支払情報】」：予約に
+    #   紐づく決済関連メールと判断し、「決済完了」「購入済」「お支払情報」を
+    #   TARGETキーワードとした。「確認メール」のような汎用的すぎる語は、
+    #   他サービスの無関係な確認メールとも衝突しうるため使用していない
+    # ・「予約完了【未購入】」：あえてTARGETに追加していない。現状の
+    #   ReservationCandidateには「未購入・支払い待ち」という状態を安全に
+    #   表現する仕組みが無く、将来自動登録する際に失効予約を通常の確定予約と
+    #   区別できずに扱ってしまう危険があるため。判定不能(UNKNOWN)のまま
+    #   維持し、ユーザーが手動で解析を試すかどうかを判断できるようにする
+    #   （reservation_status等の設計時に改めて対応する）
+    # ・「搭乗日前日のお知らせ」：既存の「お知らせ」キーワードで既にEXCLUDED
+    #   になっており、変更していない
     "スカイマーク": [
+        ClassificationRule(
+            RELEVANCE_SUPPLEMENTARY,
+            ("座席指定完了",),
+        ),
         ClassificationRule(
             RELEVANCE_EXCLUDED,
             ("レビュー", "アンケート", "キャンペーン", "広告", "セール", "お知らせ"),
+        ),
+        ClassificationRule(
+            RELEVANCE_TARGET,
+            ("決済完了", "購入済", "お支払情報"),
         ),
     ],
 }
@@ -209,7 +234,7 @@ def resolve_body_text(text_plain: str, text_html: str) -> str:
 @dataclass(frozen=True)
 class ReservationCandidate:
     """本文解析結果を「登録候補」として保持するデータ構造（Phase C。Phase Dで
-    飛行機（スカイマーク）用にflight_numberを追加）。
+    飛行機（スカイマーク）用にflight_number・fare_typeを追加）。
 
     DBへの保存はまだ行わない。この構造は登録候補プレビュー表示専用であり、
     現行のreservationsテーブルのスキーマとは1対1で対応しない（train_name・
@@ -243,6 +268,10 @@ class ReservationCandidate:
     amount: int | None
     reservation_reference: str | None
     flight_number: str | None = None
+    # 運賃種別（例：スカイマークの「いま得」等）。Phase D後半でフィールドの
+    # みを追加し、抽出実装は保留している（理由はextract_skymark()のコメント
+    # 参照）。実際の運賃種別名を列挙して判定する実装にはしない。
+    fare_type: str | None = None
     missing_fields: tuple[str, ...] = ()
 
 
@@ -1036,9 +1065,18 @@ def extract_agoda(
 # --------------------------------------------------
 # スカイマーク（飛行機予約）の抽出（Web v0.4 Phase D）
 #
-# 重要：スカイマークの実際のメール構造（件名・本文）はまだ一度も確認して
-# いない。ここでは「ラベル：値」形式の汎用的な抽出のみを行う土台実装とし、
-# 実機確認の結果を踏まえて段階的に改善する（design.md参照）。
+# Phase D後半の実機確認により、以下の構造が判明した（design.md参照）。
+#
+#   2026年09月10日(木)
+#   SKY 123便
+#   [予約番号：5678]
+#   羽田 発 08:15 → 福岡 着 10:10
+#   いま得
+#
+# 搭乗日・便名・区間/時刻はいずれもラベル（「搭乗日：」等）を伴わない
+# 構造で書かれている。既存のラベル形式抽出はそのまま残し、見つからない
+# 場合の構造依存フォールバックとして以下を追加する。予約番号のみ既存の
+# ラベル形式（「予約番号：」）と一致するため、変更していない。
 # --------------------------------------------------
 _SKYMARK_FIELD_LABELS = {
     "boarding_date": "搭乗日",
@@ -1050,23 +1088,106 @@ _SKYMARK_FIELD_LABELS = {
     "reservation_reference": "予約/申込番号",
 }
 
+# ラベルの無い「YYYY年MM月DD日(曜日)」構造。曜日部分は半角/全角括弧、
+# 1〜4文字程度（例："木"・"水曜"）を許容し、曜日自体の有無は問わない。
+# 日付そのものはハードコードせず、パターンとして抽出する。
+_SKYMARK_BARE_DATE_RE = re.compile(
+    r"(\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日)"
+    r"(?:\s*[（(][^）)\n]{1,4}[）)])?"
+)
+
+# 「SKY 123便」のように、数字の後ろに助数詞「便」が続く構造
+# （えきねっとの「N号車」と同じ発想）。"SKY"はスカイマークの公表されている
+# 便名の接頭辞（公開情報）であり任意とし、実際の便番号は固定値にしない。
+_SKYMARK_FLIGHT_NUMBER_RE = re.compile(r"(SKY)?\s*(\d{2,4})\s*便", re.IGNORECASE)
+
+
+def _extract_skymark_flight_number(body_text: str) -> str | None:
+    """「SKY 123便」のような構造から便名を抽出する。
+
+    "SKY"が実際に本文にあればそれを含めて再構成し（"SKY 123便"）、
+    無ければ数字＋便のみを返す（"123便"）。既存flight_numberフィールドの
+    表示（登録候補プレビュー）で、サービスを識別できる自然な形になるよう
+    にしている。
+    """
+    match = _SKYMARK_FLIGHT_NUMBER_RE.search(body_text)
+    if not match:
+        return None
+
+    prefix, number = match.groups()
+    if prefix:
+        return f"SKY {number}便"
+    return f"{number}便"
+
+
+# 「空港名 発 HH:MM → 空港名 着 HH:MM」というスカイマーク固有の構造。
+# スマートEX用の正規表現（駅名(時刻)構造）とは異なるため流用せず、
+# スカイマーク専用パターンとして実装する。全角/半角スペース・改行・
+# 全角/半角コロンの揺れを許容する。えきねっとの列車名が矢印を取り込んで
+# しまった過去の不具合を踏まえ、空港名の文字クラスから「発」「着」「→」を
+# 除外し、区切り文字を誤って空港名に取り込まないようにしている。
+_SKYMARK_ROUTE_RE = re.compile(
+    r"([^\s\n→発着]{1,10})\s*発\s*(\d{1,2}\s*[:：]\s*\d{2})"
+    r"\s*→\s*"
+    r"([^\s\n→発着]{1,10})\s*着\s*(\d{1,2}\s*[:：]\s*\d{2})"
+)
+
+
+def _parse_skymark_time_token(raw: str | None) -> str | None:
+    """_SKYMARK_ROUTE_REで取得した時刻表記をHH:MM形式へ変換する。
+
+    全角コロン・区切り文字前後の空白を許容する。一致しなければNoneを返す。
+    """
+    if not raw:
+        return None
+
+    match = re.match(r"\s*(\d{1,2})\s*[:：]\s*(\d{2})\s*$", raw)
+    if not match:
+        return None
+
+    hour, minute = match.groups()
+    return f"{int(hour):02d}:{minute}"
+
 
 def extract_skymark(
     message_id: str, relevance: str, subject: str, body_text: str
 ) -> ReservationCandidate:
-    """スカイマークの本文テキストから、ラベル形式で取得できた範囲のみ抽出する。
+    """スカイマークの本文テキストから、取得できた範囲の予約情報のみを抽出する。
 
     メールに存在しない項目を推測で補完することはせず、見つからなければNoneのまま扱う。
     """
     boarding_date_raw = _search_first(
-        [r"(?:ご搭乗日|搭乗日|利用日)[:：]?\s*([0-9]{4}[年/\-][0-9]{1,2}[月/\-][0-9]{1,2}日?)"],
+        [
+            r"(?:ご搭乗日|搭乗日|利用日)[:：]?\s*([0-9]{4}[年/\-][0-9]{1,2}[月/\-][0-9]{1,2}日?)",
+        ],
         body_text,
     )
+    if not boarding_date_raw:
+        bare_date_match = _SKYMARK_BARE_DATE_RE.search(body_text)
+        if bare_date_match:
+            boarding_date_raw = bare_date_match.group(1)
+
     start_time = _search_first([r"(?:出発時刻)[:：]?\s*(\d{1,2}:\d{2})"], body_text)
     end_time = _search_first([r"(?:到着時刻)[:：]?\s*(\d{1,2}:\d{2})"], body_text)
     origin = _search_first([r"(?:出発空港)[:：]?\s*([^\s\n（(]+)"], body_text)
     destination = _search_first([r"(?:到着空港)[:：]?\s*([^\s\n（(]+)"], body_text)
+
+    # ラベル形式で見つからなかった項目だけを、「空港名 発 HH:MM → 空港名
+    # 着 HH:MM」という構造から補う（ラベル形式で既に取得できた値は
+    # 上書きしない）。
+    if not (origin and destination and start_time and end_time):
+        route_match = _SKYMARK_ROUTE_RE.search(body_text)
+        if route_match:
+            route_origin, start_raw, route_destination, end_raw = route_match.groups()
+            origin = origin or route_origin.strip()
+            destination = destination or route_destination.strip()
+            start_time = start_time or _parse_skymark_time_token(start_raw)
+            end_time = end_time or _parse_skymark_time_token(end_raw)
+
     flight_number = _search_first([r"(?:便名|便)[:：]?\s*([A-Za-z0-9\-]+)"], body_text)
+    if not flight_number:
+        flight_number = _extract_skymark_flight_number(body_text)
+
     reservation_reference = _search_first(
         [r"(?:予約番号|申込番号|受付番号)[:：]?\s*([A-Za-z0-9\-]+)"], body_text
     )
@@ -1113,6 +1234,7 @@ def extract_skymark(
         amount=None,
         reservation_reference=reservation_reference,
         flight_number=flight_number,
+        fare_type=None,
         missing_fields=tuple(missing),
     )
 

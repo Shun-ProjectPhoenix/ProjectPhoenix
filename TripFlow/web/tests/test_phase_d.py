@@ -179,6 +179,44 @@ class ClassifySkymarkTests(unittest.TestCase):
         self.assertEqual(relevance, rp.RELEVANCE_UNKNOWN)
         self.assertTrue(rp.can_analyze(relevance))
 
+    def test_card_payment_completed_purchased_is_target(self) -> None:
+        # 実機確認で判明した件名種別①：カード決済完了【購入済】
+        relevance = rp.classify_candidate("スカイマーク", "スカイマーク カード決済完了【購入済】")
+        self.assertEqual(relevance, rp.RELEVANCE_TARGET)
+        self.assertTrue(rp.can_analyze(relevance))
+
+    def test_payment_information_confirmation_is_target(self) -> None:
+        # 実機確認で判明した件名種別②：確認メール【お支払情報】
+        relevance = rp.classify_candidate("スカイマーク", "スカイマーク 確認メール【お支払情報】")
+        self.assertEqual(relevance, rp.RELEVANCE_TARGET)
+        self.assertTrue(rp.can_analyze(relevance))
+
+    def test_seat_designation_completed_is_supplementary(self) -> None:
+        # 実機確認で判明した件名種別③：【座席指定完了のご案内】
+        relevance = rp.classify_candidate("スカイマーク", "スカイマーク【座席指定完了のご案内】")
+        self.assertEqual(relevance, rp.RELEVANCE_SUPPLEMENTARY)
+        self.assertTrue(rp.can_analyze(relevance))
+
+    def test_unpurchased_reservation_completed_remains_unknown(self) -> None:
+        # 実機確認で判明した件名種別④：予約完了【未購入】。
+        # 未購入・支払い待ち状態を安全に表現する仕組みがまだ無いため、
+        # 今回はあえてTARGETに追加せず判定不能のまま維持する
+        # （ユーザーが手動で解析を試すことは引き続き可能）。
+        relevance = rp.classify_candidate("スカイマーク", "スカイマーク 予約完了【未購入】")
+        self.assertEqual(relevance, rp.RELEVANCE_UNKNOWN)
+        self.assertTrue(rp.can_analyze(relevance))
+
+    def test_day_before_boarding_notice_is_excluded(self) -> None:
+        # 実機確認で判明した件名種別⑤：搭乗日前日のお知らせ。
+        # 既存の「お知らせ」キーワードで既にEXCLUDEDになっており、
+        # 変更していないことの回帰確認。
+        relevance = rp.classify_candidate("スカイマーク", "スカイマーク 搭乗日前日のお知らせ")
+        self.assertEqual(relevance, rp.RELEVANCE_EXCLUDED)
+
+    def test_service_name_alone_does_not_force_target(self) -> None:
+        relevance = rp.classify_candidate("スカイマーク", "スカイマークからの重要なお知らせ")
+        self.assertEqual(relevance, rp.RELEVANCE_EXCLUDED)
+
 
 class ExtractSmartExTests(unittest.TestCase):
     """架空データによる、ラベル形式の汎用抽出（土台実装）の確認。"""
@@ -711,6 +749,154 @@ class ExtractSkymarkTests(unittest.TestCase):
         self.assertEqual(len(candidate.missing_fields), len(rp._SKYMARK_FIELD_LABELS))
 
 
+class ExtractSkymarkConfirmedStructureTests(unittest.TestCase):
+    """Phase D後半の実機確認で判明した、スカイマーク実メールの構造
+    （架空データで再現）。実メール本文・実在の予約番号・便名・搭乗日・
+    時刻は使用しない。
+    """
+
+    def test_bare_date_without_label(self) -> None:
+        # 「YYYY年MM月DD日(曜日)」というラベル無し構造からの搭乗日抽出。
+        body = "2026年09月10日(木)\n"
+        candidate = rp.extract_skymark(
+            "msg-sky-date-1", rp.RELEVANCE_TARGET, "件名", body
+        )
+        self.assertEqual(candidate.date, date(2026, 9, 10))
+
+    def test_bare_date_without_weekday(self) -> None:
+        body = "2026年9月10日\n"
+        candidate = rp.extract_skymark(
+            "msg-sky-date-2", rp.RELEVANCE_TARGET, "件名", body
+        )
+        self.assertEqual(candidate.date, date(2026, 9, 10))
+
+    def test_bare_date_with_fullwidth_parentheses_weekday(self) -> None:
+        body = "2026年09月10日（木）\n"
+        candidate = rp.extract_skymark(
+            "msg-sky-date-3", rp.RELEVANCE_TARGET, "件名", body
+        )
+        self.assertEqual(candidate.date, date(2026, 9, 10))
+
+    def test_flight_number_with_sky_prefix(self) -> None:
+        # 「SKY 123便」構造からの便名抽出。便番号は固定値にしない
+        # （別の番号でも動作することを別テストで確認する）。
+        body = "SKY 123便\n"
+        candidate = rp.extract_skymark(
+            "msg-sky-flight-1", rp.RELEVANCE_TARGET, "件名", body
+        )
+        self.assertEqual(candidate.flight_number, "SKY 123便")
+
+    def test_flight_number_with_sky_prefix_different_number(self) -> None:
+        body = "SKY 456便\n"
+        candidate = rp.extract_skymark(
+            "msg-sky-flight-2", rp.RELEVANCE_TARGET, "件名", body
+        )
+        self.assertEqual(candidate.flight_number, "SKY 456便")
+
+    def test_flight_number_without_sky_prefix(self) -> None:
+        # "SKY"表記が無い場合でも「数字＋便」の構造から取得できることの確認。
+        body = "789便\n"
+        candidate = rp.extract_skymark(
+            "msg-sky-flight-3", rp.RELEVANCE_TARGET, "件名", body
+        )
+        self.assertEqual(candidate.flight_number, "789便")
+
+    def test_route_extracts_airports_and_times(self) -> None:
+        # 「空港名 発 HH:MM → 空港名 着 HH:MM」構造からの区間・時刻抽出。
+        body = "サンプル空港 発 08:15 → 見本空港 着 10:10\n"
+        candidate = rp.extract_skymark(
+            "msg-sky-route-1", rp.RELEVANCE_TARGET, "件名", body
+        )
+        self.assertEqual(candidate.origin, "サンプル空港")
+        self.assertEqual(candidate.destination, "見本空港")
+        self.assertEqual(candidate.start_time, "08:15")
+        self.assertEqual(candidate.end_time, "10:10")
+
+    def test_route_different_airports_not_hardcoded(self) -> None:
+        # 別の空港名でも動作することの確認。空港名自体に「発」「着」の
+        # 文字を含めない（航空券の実際の空港名には通常含まれないため）。
+        body = "ワンダー空港 発 23:55 → トゥエルブ空港 着 01:10\n"
+        candidate = rp.extract_skymark(
+            "msg-sky-route-2", rp.RELEVANCE_TARGET, "件名", body
+        )
+        self.assertEqual(candidate.origin, "ワンダー空港")
+        self.assertEqual(candidate.destination, "トゥエルブ空港")
+        self.assertEqual(candidate.start_time, "23:55")
+        self.assertEqual(candidate.end_time, "01:10")
+
+    def test_route_with_fullwidth_space_and_colon(self) -> None:
+        body = "サンプル空港　発　08：15\n→\n見本空港　着　10：10\n"
+        candidate = rp.extract_skymark(
+            "msg-sky-route-3", rp.RELEVANCE_TARGET, "件名", body
+        )
+        self.assertEqual(candidate.origin, "サンプル空港")
+        self.assertEqual(candidate.destination, "見本空港")
+        self.assertEqual(candidate.start_time, "08:15")
+        self.assertEqual(candidate.end_time, "10:10")
+
+    def test_route_with_linebreaks_and_no_space_around_arrow(self) -> None:
+        body = "サンプル空港\n発\n08:15\n→\n見本空港\n着\n10:10\n"
+        candidate = rp.extract_skymark(
+            "msg-sky-route-4", rp.RELEVANCE_TARGET, "件名", body
+        )
+        self.assertEqual(candidate.origin, "サンプル空港")
+        self.assertEqual(candidate.destination, "見本空港")
+        self.assertEqual(candidate.start_time, "08:15")
+        self.assertEqual(candidate.end_time, "10:10")
+
+    def test_route_does_not_override_labeled_values(self) -> None:
+        body = (
+            "出発空港：ラベル空港　出発時刻：10:00\n"
+            "到着空港：ラベル到着空港　到着時刻：11:20\n"
+            "ラベル空港 発 08:15 → ラベル到着空港 着 09:30\n"
+        )
+        candidate = rp.extract_skymark(
+            "msg-sky-route-5", rp.RELEVANCE_TARGET, "件名", body
+        )
+        self.assertEqual(candidate.start_time, "10:00")
+        self.assertEqual(candidate.end_time, "11:20")
+
+    def test_reservation_reference_in_brackets(self) -> None:
+        # 「[予約番号：XXXX]」のように角括弧で囲まれていても取得できることの確認。
+        body = "[予約番号：5678]\n"
+        candidate = rp.extract_skymark(
+            "msg-sky-ref-1", rp.RELEVANCE_TARGET, "件名", body
+        )
+        self.assertEqual(candidate.reservation_reference, "5678")
+
+    def test_fare_type_field_exists_but_is_not_extracted(self) -> None:
+        # fare_typeフィールドは追加したが、抽出は今回保留している
+        # （安全に判断できるラベル・構造上の目印が無いため）。
+        body = "いま得\n"
+        candidate = rp.extract_skymark(
+            "msg-sky-fare-1", rp.RELEVANCE_TARGET, "件名", body
+        )
+        self.assertIsNone(candidate.fare_type)
+
+    def test_full_confirmed_structure_yields_high_confidence(self) -> None:
+        # 実機確認で判明した一連の構造をまとめて再現したケース。
+        body = (
+            "2026年09月10日(木)\n"
+            "SKY 123便\n"
+            "[予約番号：5678]\n"
+            "サンプル空港 発 08:15 → 見本空港 着 10:10\n"
+            "いま得\n"
+        )
+        candidate = rp.extract_skymark(
+            "msg-sky-full-1", rp.RELEVANCE_TARGET, "スカイマーク カード決済完了【購入済】", body
+        )
+
+        self.assertEqual(candidate.date, date(2026, 9, 10))
+        self.assertEqual(candidate.flight_number, "SKY 123便")
+        self.assertEqual(candidate.reservation_reference, "5678")
+        self.assertEqual(candidate.origin, "サンプル空港")
+        self.assertEqual(candidate.destination, "見本空港")
+        self.assertEqual(candidate.start_time, "08:15")
+        self.assertEqual(candidate.end_time, "10:10")
+        self.assertEqual(candidate.confidence, "高")
+        self.assertIsNone(candidate.fare_type)
+
+
 class AnalyzeEmailDispatchPhaseDTests(unittest.TestCase):
     def test_dispatches_to_smart_ex(self) -> None:
         candidate = rp.analyze_email(
@@ -753,6 +939,24 @@ class ExistingServicesUnaffectedTests(unittest.TestCase):
             "msg-regress-2", rp.RELEVANCE_TARGET, "予約確認", "ホテル名：サンプルホテル\n"
         )
         self.assertIsNone(candidate.flight_number)
+
+    def test_ekinet_candidate_has_no_fare_type(self) -> None:
+        candidate = rp.extract_ekinet(
+            "msg-regress-3", rp.RELEVANCE_TARGET, "件名", "ご乗車日：2026年09月10日\n"
+        )
+        self.assertIsNone(candidate.fare_type)
+
+    def test_agoda_candidate_has_no_fare_type(self) -> None:
+        candidate = rp.extract_agoda(
+            "msg-regress-4", rp.RELEVANCE_TARGET, "予約確認", "ホテル名：サンプルホテル\n"
+        )
+        self.assertIsNone(candidate.fare_type)
+
+    def test_smart_ex_candidate_has_no_fare_type(self) -> None:
+        candidate = rp.extract_smart_ex(
+            "msg-regress-5", rp.RELEVANCE_TARGET, "件名", "乗車日：2026年09月10日\n"
+        )
+        self.assertIsNone(candidate.fare_type)
 
 
 class NoPersonalInfoLeakPhaseDTests(unittest.TestCase):
