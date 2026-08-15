@@ -36,6 +36,17 @@ REQUEST_TIMEOUT_SECONDS = 15.0
 # まだ確認していない段階での「広めの初期案」であり、確定仕様ではない。
 # Phase Bで実際にログイン中ユーザーのGmailを検索し、取得できたメールの
 # 送信元・件名を確認したうえで、このルールを見直すことを前提にしている。
+#
+# Web v0.4 Phase D：スマートEX（東海道・山陽新幹線のネット予約サービス）・
+# スカイマークを追加した。ドメインは各社が公表している公式サイトのドメイン
+# （個人情報ではなく、会社が一般公開している情報）を初期案として設定して
+# いるが、実際の送信元メールアドレスをユーザーのGmailで確認したわけでは
+# ない。えきねっと・Agodaと同様、実機確認の結果を踏まえて見直す前提。
+#
+# スマートEXは実機確認（Phase D）により、実際の送信元ドメインが
+# expy.jpであることを確認できた。初期案だったsmart-ex.jpは、実際の
+# 送信元として確認できていないが、公式ドメインである可能性も残るため
+# 削除せず両方を候補に残している。
 SERVICE_SEARCH_RULES: dict[str, dict[str, list[str]]] = {
     "えきねっと": {
         "from_domains": ["eki-net.com"],
@@ -44,6 +55,14 @@ SERVICE_SEARCH_RULES: dict[str, dict[str, list[str]]] = {
     "Agoda": {
         "from_domains": ["agoda.com"],
         "subject_keywords": ["Agoda"],
+    },
+    "スマートEX": {
+        "from_domains": ["expy.jp", "smart-ex.jp"],
+        "subject_keywords": ["スマートEX", "SmartEX"],
+    },
+    "スカイマーク": {
+        "from_domains": ["skymark.co.jp", "skymark.jp"],
+        "subject_keywords": ["スカイマーク", "Skymark"],
     },
 }
 

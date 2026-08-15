@@ -441,7 +441,7 @@ def _gmail_access_available() -> bool:
 # Web v0.4 Phase B: Gmailから予約メール候補を検索・一覧表示する。
 # 本文の本格解析・予約登録・DB保存はまだ行わない（候補の検索・一覧表示まで）。
 # --------------------------------------------------
-GMAIL_SEARCH_SERVICE_OPTIONS = ["えきねっと", "Agoda", "両方"]
+GMAIL_SEARCH_SERVICE_OPTIONS = ["えきねっと", "Agoda", "スマートEX", "スカイマーク", "すべて"]
 GMAIL_SEARCH_PERIOD_OPTIONS = [1, 3, 6, 12]
 GMAIL_CANDIDATES_SESSION_KEY = "tripflow_gmail_candidates"
 GMAIL_SEARCH_ERROR_SESSION_KEY = "tripflow_gmail_search_error"
@@ -463,7 +463,7 @@ _RELEVANCE_BADGES = {
 
 
 def _gmail_selected_services(choice: str) -> list[str]:
-    if choice == "両方":
+    if choice == "すべて":
         return list(gmail_service.SUPPORTED_SERVICES)
     return [choice]
 
@@ -560,7 +560,10 @@ def _render_gmail_search_section() -> None:
 
                 with st.container(border=True):
                     st.markdown(f"**{candidate.subject}**")
-                    st.caption(f"{candidate.service}｜{candidate.received_at}")
+                    service_icon = SERVICE_ICONS.get(candidate.service, "📌")
+                    st.caption(
+                        f"{service_icon} {candidate.service}｜{candidate.received_at}"
+                    )
                     st.caption(candidate.sender)
                     if candidate.snippet:
                         st.write(candidate.snippet)

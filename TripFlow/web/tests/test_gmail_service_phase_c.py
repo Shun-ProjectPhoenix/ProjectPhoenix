@@ -199,8 +199,11 @@ class TokenLeakageTests(unittest.TestCase):
 class PhaseABRegressionTests(unittest.TestCase):
     """Phase A/Bの既存動作（検索クエリ構築・候補一覧）が壊れていないことを確認する。"""
 
-    def test_supported_services_unchanged(self) -> None:
-        self.assertEqual(set(gs.SUPPORTED_SERVICES), {"えきねっと", "Agoda"})
+    def test_supported_services_includes_phase_b_services(self) -> None:
+        # Phase D以降、対応サービスが増えることを許容しつつ、Phase Bで
+        # 確認済みの2サービスが引き続き含まれることを確認する。
+        self.assertIn("えきねっと", gs.SUPPORTED_SERVICES)
+        self.assertIn("Agoda", gs.SUPPORTED_SERVICES)
 
     def test_build_search_query_includes_domain_and_period(self) -> None:
         query = gs.build_search_query("えきねっと", months=3)

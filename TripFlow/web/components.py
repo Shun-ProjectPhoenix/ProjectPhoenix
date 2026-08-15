@@ -34,9 +34,11 @@ SERVICE_CSS_CLASSES = {
 }
 
 # サービス → カレンダー表示用アイコン対応表。
+# えきねっとと区別しやすいよう、スマートEXには別の新幹線アイコンを充てている
+# （Web v0.4 Phase Dで、Gmail連携の候補一覧上でも視覚的に区別できるように変更）。
 SERVICE_ICONS = {
     "えきねっと": "🚄",
-    "スマートEX": "🚄",
+    "スマートEX": "🚅",
     "スカイマーク": "✈️",
     "Agoda": "🏨",
     "その他": "📌",
@@ -371,13 +373,16 @@ def render_trip_jump_button(
 def render_registration_candidate_card(candidate: Any) -> None:
     """Gmail本文解析結果を、登録候補プレビューとしてカード形式で表示する。
 
-    種類（電車／ホテル／その他）に応じて表示項目を出し分け、値がNoneの
-    項目は表示しない。DBへの登録はPhase C時点では行わず、その旨を
-    常に案内する。
+    種類（電車／ホテル／飛行機／その他）に応じて表示項目を出し分け、値が
+    Noneの項目は表示しない。DBへの登録はPhase D前半時点でも行わず、その旨を
+    常に案内する。アイコンはSERVICE_ICONS（サービス名ベース）を使い、
+    えきねっと・スマートEXのように同じ種類（電車）でもサービスごとに
+    見分けられるようにする。
     """
     with st.container(border=True):
         if candidate.reservation_type == "電車":
-            st.markdown(f"**🚄 {candidate.service}**")
+            icon = SERVICE_ICONS.get(candidate.service, "🚄")
+            st.markdown(f"**{icon} {candidate.service}**")
 
             if candidate.origin and candidate.destination:
                 st.markdown(f"{candidate.origin} → {candidate.destination}")
@@ -399,8 +404,12 @@ def render_registration_candidate_card(candidate: Any) -> None:
             if candidate.start_time or candidate.end_time:
                 st.caption(f"{candidate.start_time or '？'} → {candidate.end_time or '？'}")
 
+            if candidate.amount is not None:
+                st.markdown(f"料金：{_format_amount(candidate.amount)}")
+
         elif candidate.reservation_type == "ホテル":
-            st.markdown(f"**🏨 {candidate.service}**")
+            icon = SERVICE_ICONS.get(candidate.service, "🏨")
+            st.markdown(f"**{icon} {candidate.service}**")
 
             if candidate.hotel_name:
                 st.markdown(candidate.hotel_name)
@@ -416,8 +425,27 @@ def render_registration_candidate_card(candidate: Any) -> None:
             if candidate.amount is not None:
                 st.markdown(f"料金：{_format_amount(candidate.amount)}")
 
+        elif candidate.reservation_type == "飛行機":
+            icon = SERVICE_ICONS.get(candidate.service, "✈️")
+            st.markdown(f"**{icon} {candidate.service}**")
+
+            if candidate.origin and candidate.destination:
+                st.markdown(f"{candidate.origin} → {candidate.destination}")
+            elif candidate.origin or candidate.destination:
+                st.markdown(candidate.origin or candidate.destination)
+
+            if candidate.date:
+                st.markdown(_format_date(candidate.date.isoformat()))
+
+            if candidate.flight_number:
+                st.markdown(candidate.flight_number)
+
+            if candidate.start_time or candidate.end_time:
+                st.caption(f"{candidate.start_time or '？'} → {candidate.end_time or '？'}")
+
         else:
-            st.markdown(f"**📌 {candidate.service}**")
+            icon = SERVICE_ICONS.get(candidate.service, "📌")
+            st.markdown(f"**{icon} {candidate.service}**")
             if candidate.title:
                 st.markdown(candidate.title)
 
