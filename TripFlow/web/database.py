@@ -72,6 +72,10 @@ def init_db() -> None:
                 memo TEXT,
                 check_in_date TEXT,
                 check_out_date TEXT,
+                gmail_message_id TEXT,
+                gmail_thread_id TEXT,
+                source_type TEXT NOT NULL DEFAULT 'manual',
+                reservation_key TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY (trip_id) REFERENCES trips (id) ON DELETE CASCADE
@@ -94,6 +98,28 @@ def init_db() -> None:
 
         if "check_out_date" not in reservations_columns:
             conn.execute("ALTER TABLE reservations ADD COLUMN check_out_date TEXT")
+
+        # Web v0.4 Phase E-1：将来のGmail解析結果登録・重複防止設計
+        # （claude_report.md参照）に向けた土台となる列を追加する。
+        # この段階ではINSERT/UPDATE処理・重複チェック・キー生成ロジックは
+        # 一切実装せず、列を安全に追加するだけにとどめる。
+        # gmail_message_id・reservation_keyにはUNIQUE制約を付けない
+        # （同一予約が複数区間・複数泊・複数搭乗者にまたがる可能性があり、
+        # DB層で一意性を強制すると正当なケースでINSERTが失敗しうるため）。
+        if "gmail_message_id" not in reservations_columns:
+            conn.execute("ALTER TABLE reservations ADD COLUMN gmail_message_id TEXT")
+
+        if "gmail_thread_id" not in reservations_columns:
+            conn.execute("ALTER TABLE reservations ADD COLUMN gmail_thread_id TEXT")
+
+        if "source_type" not in reservations_columns:
+            conn.execute(
+                "ALTER TABLE reservations "
+                "ADD COLUMN source_type TEXT NOT NULL DEFAULT 'manual'"
+            )
+
+        if "reservation_key" not in reservations_columns:
+            conn.execute("ALTER TABLE reservations ADD COLUMN reservation_key TEXT")
 
         # 既存のホテル予約を安全に移行する。check_in_dateが未設定の行だけを
         # 対象にしているため、何度実行しても既存の値を上書きしない。
