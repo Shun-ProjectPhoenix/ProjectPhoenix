@@ -440,6 +440,9 @@ def render_registration_candidate_card(candidate: Any) -> None:
             if candidate.flight_number:
                 st.markdown(candidate.flight_number)
 
+            if candidate.seat_number:
+                st.markdown(candidate.seat_number)
+
             if candidate.start_time or candidate.end_time:
                 st.caption(f"{candidate.start_time or '？'} → {candidate.end_time or '？'}")
 

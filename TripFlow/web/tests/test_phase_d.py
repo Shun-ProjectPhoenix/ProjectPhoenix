@@ -185,10 +185,15 @@ class ClassifySkymarkTests(unittest.TestCase):
         self.assertEqual(relevance, rp.RELEVANCE_TARGET)
         self.assertTrue(rp.can_analyze(relevance))
 
-    def test_payment_information_confirmation_is_target(self) -> None:
-        # 実機確認で判明した件名種別②：確認メール【お支払情報】
+    def test_payment_information_confirmation_is_secondary_unknown(self) -> None:
+        # 実機確認（分類整理）：確認メール【お支払情報】は、正本メール
+        # （カード決済完了【購入済】）と同じ予約情報を含む可能性があるが、
+        # 座席番号を含まないケースが実機確認で判明した。正本メールと同格に
+        # TARGET扱いすると、将来の自動登録で同一予約が重複登録される
+        # 危険があるため、SECONDARY（予備候補）として判定不能(UNKNOWN)に
+        # 分類する。UNKNOWNでも手動解析は引き続き可能。
         relevance = rp.classify_candidate("スカイマーク", "スカイマーク 確認メール【お支払情報】")
-        self.assertEqual(relevance, rp.RELEVANCE_TARGET)
+        self.assertEqual(relevance, rp.RELEVANCE_UNKNOWN)
         self.assertTrue(rp.can_analyze(relevance))
 
     def test_seat_designation_completed_is_supplementary(self) -> None:
@@ -216,6 +221,52 @@ class ClassifySkymarkTests(unittest.TestCase):
     def test_service_name_alone_does_not_force_target(self) -> None:
         relevance = rp.classify_candidate("スカイマーク", "スカイマークからの重要なお知らせ")
         self.assertEqual(relevance, rp.RELEVANCE_EXCLUDED)
+
+
+class SkymarkClassificationDesignSummaryTests(unittest.TestCase):
+    """Phase D後半（分類整理）で確定した、スカイマークのメール種別ごとの
+    分類方針を一覧で確認する回帰テスト。実際の件名文言は架空のものであり、
+    実メール本文・個人情報は含まない。
+
+    設計（docs/design.md 22章参照）：
+    ・PRIMARY（正本メール）＝カード決済完了【購入済】 → TARGET
+    ・SUPPLEMENTARY（予約補完メール）＝座席指定完了のご案内 → SUPPLEMENTARY
+    ・SECONDARY（予備候補、正本と同格に扱わない）＝確認メール【お支払情報】→ UNKNOWN
+    ・予約完了【未購入】 → UNKNOWN（変更なし）
+    ・搭乗日前日のお知らせ・広告・キャンペーン・レビュー等 → EXCLUDED（変更なし）
+    """
+
+    def test_primary_mail_is_target(self) -> None:
+        relevance = rp.classify_candidate("スカイマーク", "スカイマーク カード決済完了【購入済】")
+        self.assertEqual(relevance, rp.RELEVANCE_TARGET)
+
+    def test_supplementary_mail_is_supplementary(self) -> None:
+        relevance = rp.classify_candidate("スカイマーク", "スカイマーク【座席指定完了のご案内】")
+        self.assertEqual(relevance, rp.RELEVANCE_SUPPLEMENTARY)
+
+    def test_secondary_mail_is_not_primary_target(self) -> None:
+        # 「主登録対象ではない」＝TARGET（PRIMARY）にはならないことを確認する。
+        relevance = rp.classify_candidate("スカイマーク", "スカイマーク 確認メール【お支払情報】")
+        self.assertNotEqual(relevance, rp.RELEVANCE_TARGET)
+        self.assertEqual(relevance, rp.RELEVANCE_UNKNOWN)
+
+    def test_unpurchased_mail_is_unknown(self) -> None:
+        relevance = rp.classify_candidate("スカイマーク", "スカイマーク 予約完了【未購入】")
+        self.assertEqual(relevance, rp.RELEVANCE_UNKNOWN)
+
+    def test_day_before_notice_is_excluded(self) -> None:
+        relevance = rp.classify_candidate("スカイマーク", "スカイマーク 搭乗日前日のお知らせ")
+        self.assertEqual(relevance, rp.RELEVANCE_EXCLUDED)
+
+    def test_advertisement_campaign_review_remain_excluded(self) -> None:
+        for subject in (
+            "スカイマーク 夏の早期予約セール開催中",
+            "スカイマーク 新機能の広告のお知らせ",
+            "スカイマーク ご搭乗後アンケートのお願い",
+        ):
+            with self.subTest(subject=subject):
+                relevance = rp.classify_candidate("スカイマーク", subject)
+                self.assertEqual(relevance, rp.RELEVANCE_EXCLUDED)
 
 
 class ExtractSmartExTests(unittest.TestCase):
@@ -897,6 +948,154 @@ class ExtractSkymarkConfirmedStructureTests(unittest.TestCase):
         self.assertIsNone(candidate.fare_type)
 
 
+class ExtractSkymarkSeatNumberTests(unittest.TestCase):
+    """Phase D後半（座席番号対応）の実機確認で判明した、座席番号の2つの
+    表現パターン（架空データで再現）。実メール本文・実在の氏名・座席番号は
+    使用しない。
+    """
+
+    # --- パターンA：明確なラベル形式 ---
+
+    def test_labeled_seat_with_halfwidth_colon(self) -> None:
+        body = "座席番号:17H\n"
+        candidate = rp.extract_skymark(
+            "msg-seat-a1", rp.RELEVANCE_TARGET, "件名", body
+        )
+        self.assertEqual(candidate.seat_number, "17H")
+
+    def test_labeled_seat_with_fullwidth_colon(self) -> None:
+        body = "座席番号：17H\n"
+        candidate = rp.extract_skymark(
+            "msg-seat-a2", rp.RELEVANCE_TARGET, "件名", body
+        )
+        self.assertEqual(candidate.seat_number, "17H")
+
+    def test_labeled_seat_with_spaces_around_colon(self) -> None:
+        body = "座席番号 : 17H\n"
+        candidate = rp.extract_skymark(
+            "msg-seat-a3", rp.RELEVANCE_TARGET, "件名", body
+        )
+        self.assertEqual(candidate.seat_number, "17H")
+
+    def test_labeled_seat_different_value_not_hardcoded(self) -> None:
+        # 別の座席番号でも動作することの確認（固定値をハードコードしていない）。
+        body = "座席番号：3A\n"
+        candidate = rp.extract_skymark(
+            "msg-seat-a4", rp.RELEVANCE_TARGET, "件名", body
+        )
+        self.assertEqual(candidate.seat_number, "3A")
+
+    # --- パターンB：搭乗者情報末尾の座席番号（見出し文脈が必要） ---
+
+    def test_passenger_seat_with_context_heading(self) -> None:
+        body = "ご搭乗者／座席番号\nサンプル 花子 様（大人）/19C\n"
+        candidate = rp.extract_skymark(
+            "msg-seat-b1", rp.RELEVANCE_SUPPLEMENTARY, "件名", body
+        )
+        self.assertEqual(candidate.seat_number, "19C")
+
+    def test_passenger_seat_different_name_and_seat_not_hardcoded(self) -> None:
+        body = "ご搭乗者／座席番号\nサンプル 次郎 様（大人）/5B\n"
+        candidate = rp.extract_skymark(
+            "msg-seat-b2", rp.RELEVANCE_SUPPLEMENTARY, "件名", body
+        )
+        self.assertEqual(candidate.seat_number, "5B")
+
+    def test_passenger_seat_without_context_heading_is_none(self) -> None:
+        # 「ご搭乗者／座席番号」に相当する見出し文脈が無い場合、
+        # 「様.../XXY」だけでは座席番号として採用しない（安全側の設計）。
+        body = "サンプル 花子 様（大人）/19C\n"
+        candidate = rp.extract_skymark(
+            "msg-seat-b3", rp.RELEVANCE_UNKNOWN, "件名", body
+        )
+        self.assertIsNone(candidate.seat_number)
+
+    def test_context_heading_without_passenger_pattern_is_none(self) -> None:
+        body = "ご搭乗者／座席番号\n未定\n"
+        candidate = rp.extract_skymark(
+            "msg-seat-b4", rp.RELEVANCE_SUPPLEMENTARY, "件名", body
+        )
+        self.assertIsNone(candidate.seat_number)
+
+    # --- 誤抽出防止 ---
+
+    def test_url_is_not_captured_as_seat_number(self) -> None:
+        body = "詳細はこちら：https://example.com/19C をご確認ください。\n"
+        candidate = rp.extract_skymark(
+            "msg-seat-safety-1", rp.RELEVANCE_TARGET, "件名", body
+        )
+        self.assertIsNone(candidate.seat_number)
+
+    def test_date_like_slash_pattern_without_context_is_not_captured(self) -> None:
+        body = "発行日 2026/09/10\nサンプル 花子 様\n"
+        candidate = rp.extract_skymark(
+            "msg-seat-safety-2", rp.RELEVANCE_TARGET, "件名", body
+        )
+        self.assertIsNone(candidate.seat_number)
+
+    def test_reservation_number_like_value_after_context_is_not_captured(self) -> None:
+        # 座席コードの形（数字＋英字1文字）に一致しない値は取得しない。
+        body = "ご搭乗者／座席番号\nサンプル 花子 様/AB123\n"
+        candidate = rp.extract_skymark(
+            "msg-seat-safety-3", rp.RELEVANCE_SUPPLEMENTARY, "件名", body
+        )
+        self.assertIsNone(candidate.seat_number)
+
+    # --- 座席情報が無いメール ---
+
+    def test_no_seat_information_returns_none(self) -> None:
+        body = "サンプル空港 発 08:15 → 見本空港 着 10:10\n"
+        candidate = rp.extract_skymark(
+            "msg-seat-none-1", rp.RELEVANCE_TARGET, "件名", body
+        )
+        self.assertIsNone(candidate.seat_number)
+        self.assertIn("座席番号", candidate.missing_fields)
+
+    # --- 既存スカイマーク基本解析の回帰 ---
+
+    def test_existing_basic_fields_unaffected_by_seat_extraction(self) -> None:
+        # 座席番号対応の追加が、搭乗日・便名・区間・時刻・予約番号・
+        # fare_typeの既存抽出を壊していないことの回帰確認。
+        body = (
+            "2026年09月10日(木)\n"
+            "SKY 123便\n"
+            "[予約番号：5678]\n"
+            "サンプル空港 発 08:15 → 見本空港 着 10:10\n"
+            "いま得\n"
+        )
+        candidate = rp.extract_skymark(
+            "msg-seat-regress-1", rp.RELEVANCE_TARGET, "スカイマーク カード決済完了【購入済】", body
+        )
+
+        self.assertEqual(candidate.date, date(2026, 9, 10))
+        self.assertEqual(candidate.flight_number, "SKY 123便")
+        self.assertEqual(candidate.reservation_reference, "5678")
+        self.assertEqual(candidate.origin, "サンプル空港")
+        self.assertEqual(candidate.destination, "見本空港")
+        self.assertEqual(candidate.start_time, "08:15")
+        self.assertEqual(candidate.end_time, "10:10")
+        self.assertEqual(candidate.confidence, "高")
+        self.assertIsNone(candidate.fare_type)
+        self.assertIsNone(candidate.seat_number)
+
+    def test_full_structure_with_labeled_seat_number(self) -> None:
+        # 決済済み系メールに座席番号ラベルが含まれる場合の一連の構造。
+        body = (
+            "2026年09月10日(木)\n"
+            "SKY 123便\n"
+            "[予約番号：5678]\n"
+            "サンプル空港 発 08:15 → 見本空港 着 10:10\n"
+            "座席番号：17H\n"
+        )
+        candidate = rp.extract_skymark(
+            "msg-seat-full-1", rp.RELEVANCE_TARGET, "スカイマーク カード決済完了【購入済】", body
+        )
+
+        self.assertEqual(candidate.seat_number, "17H")
+        self.assertEqual(candidate.confidence, "高")
+        self.assertEqual(candidate.missing_fields, ())
+
+
 class AnalyzeEmailDispatchPhaseDTests(unittest.TestCase):
     def test_dispatches_to_smart_ex(self) -> None:
         candidate = rp.analyze_email(
@@ -997,6 +1196,18 @@ class NoPersonalInfoLeakPhaseDTests(unittest.TestCase):
                 self.assertNotIn("山田", value)
                 self.assertNotIn("9999888877", value)
                 self.assertNotIn("090-1234-5678", value)
+
+    def test_skymark_passenger_seat_extraction_does_not_capture_passenger_name(
+        self,
+    ) -> None:
+        # パターンB（「様.../19C」構造）は座席コードのみを抽出し、
+        # 氏名部分（「様」の前の文字列）を一切含まないことを確認する。
+        body = "ご搭乗者／座席番号\n山田 太郎 様（大人）/19C\n"
+        candidate = rp.extract_skymark("msg-pii-3", rp.RELEVANCE_SUPPLEMENTARY, "件名", body)
+
+        self.assertEqual(candidate.seat_number, "19C")
+        self.assertNotIn("山田", candidate.seat_number)
+        self.assertNotIn("太郎", candidate.seat_number)
 
 
 if __name__ == "__main__":

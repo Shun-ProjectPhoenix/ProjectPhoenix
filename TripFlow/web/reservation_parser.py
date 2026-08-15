@@ -122,23 +122,32 @@ SUBJECT_CLASSIFICATION_RULES: dict[str, list[ClassificationRule]] = {
             ("新幹線予約内容", "申込", "予約確認", "ご予約内容", "予約完了", "購入完了"),
         ),
     ],
-    # Web v0.4 Phase D後半：スカイマークの実機確認で、以下の件名種別が
-    # 存在することを確認できた（design.md参照）。
-    # ・「座席指定完了のご案内」：えきねっと「座席番号のご案内」・スマートEX
-    #   「乗車用ICカード指定内容」と同じ位置づけの予約補完メールと判断し、
-    #   「座席指定完了」をSUPPLEMENTARYキーワードとした
-    # ・「カード決済完了【購入済】」「確認メール【お支払情報】」：予約に
-    #   紐づく決済関連メールと判断し、「決済完了」「購入済」「お支払情報」を
-    #   TARGETキーワードとした。「確認メール」のような汎用的すぎる語は、
-    #   他サービスの無関係な確認メールとも衝突しうるため使用していない
-    # ・「予約完了【未購入】」：あえてTARGETに追加していない。現状の
-    #   ReservationCandidateには「未購入・支払い待ち」という状態を安全に
-    #   表現する仕組みが無く、将来自動登録する際に失効予約を通常の確定予約と
-    #   区別できずに扱ってしまう危険があるため。判定不能(UNKNOWN)のまま
-    #   維持し、ユーザーが手動で解析を試すかどうかを判断できるようにする
+    # Web v0.4 Phase D後半：スカイマークの実機確認で、複数種別のメールが
+    # 同一予約について送られてくることが判明した（design.md 22章参照）。
+    # 新しい分類定数は増やさず、既存の4分類（対象／予約補完メール／対象外／
+    # 判定不能）の枠内で「正本メール（主メール）」の考え方を表現している。
+    #
+    # ・「カード決済完了【購入済】」＝PRIMARY（正本メール）：実機確認で
+    #   搭乗日・区間・便名・時刻・予約番号・座席番号のすべてが取得でき、
+    #   confidence「高」になることを確認できた、最も情報が揃ったメール。
+    #   将来、同一予約の複数メールを自動統合する際にも、この正本メールを
+    #   基準にする設計方針とした（design.md参照）。分類上はTARGETのまま
+    # ・「座席指定完了のご案内」＝SUPPLEMENTARY（予約補完メール）：えきねっと
+    #   「座席番号のご案内」・スマートEX「乗車用ICカード指定内容」と同じ
+    #   位置づけ。変更していない
+    # ・「確認メール【お支払情報】」＝SECONDARY（予備候補）：正本メールと
+    #   同じ予約情報を含む可能性があるが、実機確認で座席番号を含まない
+    #   ケースが確認された。正本メールほど情報が揃っていないうえ、正本
+    #   メールと同格にTARGET扱いすると、将来DB自動登録を実装した際に
+    #   同一予約が重複登録される危険がある。そのため今回、TARGETキーワード
+    #   から「お支払情報」を外し、判定不能(UNKNOWN)へ変更した。UNKNOWNでも
+    #   ユーザーが手動で「予約情報を解析」できる点は変わらない（can_analyze()
+    #   はEXCLUDED以外すべてTrueを返す既存の仕組みをそのまま使う）
+    # ・「予約完了【未購入】」＝UNKNOWN：変更なし。未購入・支払い待ち状態を
+    #   安全に表現する仕組みが無いため、引き続き判定不能のまま維持する
     #   （reservation_status等の設計時に改めて対応する）
-    # ・「搭乗日前日のお知らせ」：既存の「お知らせ」キーワードで既にEXCLUDED
-    #   になっており、変更していない
+    # ・「搭乗日前日のお知らせ」＝EXCLUDED：既存の「お知らせ」キーワードで
+    #   既に対象外になっており、変更していない
     "スカイマーク": [
         ClassificationRule(
             RELEVANCE_SUPPLEMENTARY,
@@ -148,9 +157,12 @@ SUBJECT_CLASSIFICATION_RULES: dict[str, list[ClassificationRule]] = {
             RELEVANCE_EXCLUDED,
             ("レビュー", "アンケート", "キャンペーン", "広告", "セール", "お知らせ"),
         ),
+        # 「決済完了」「購入済」のみをTARGET（正本メール＝PRIMARY）とする。
+        # 「お支払情報」はTARGETから外し、判定不能(UNKNOWN)へ委ねる
+        # （SECONDARY＝予備候補。今回の分類整理で変更した点）。
         ClassificationRule(
             RELEVANCE_TARGET,
-            ("決済完了", "購入済", "お支払情報"),
+            ("決済完了", "購入済"),
         ),
     ],
 }
@@ -1086,6 +1098,7 @@ _SKYMARK_FIELD_LABELS = {
     "destination": "到着空港",
     "flight_number": "便名",
     "reservation_reference": "予約/申込番号",
+    "seat_number": "座席番号",
 }
 
 # ラベルの無い「YYYY年MM月DD日(曜日)」構造。曜日部分は半角/全角括弧、
@@ -1149,6 +1162,40 @@ def _parse_skymark_time_token(raw: str | None) -> str | None:
     return f"{int(hour):02d}:{minute}"
 
 
+# Phase D後半（座席番号対応）で実機確認された、座席番号の2つの表現パターン。
+#
+# パターンA：決済済み系メール本文の「座席番号：17H」のような、明確な
+# ラベル形式（空白・半角/全角コロンの揺れを許容）。extract_skymark()内で
+# _search_firstへ直接渡すため、ここでは定数化していない。
+#
+# パターンB：座席指定完了メール本文の「ご搭乗者／座席番号」という見出しの
+# 下に、「架空 太郎 様（大人）/19C」のように搭乗者情報の末尾へ座席番号が
+# 付く形式。本文中の「/[数字][アルファベット]」を無条件に拾うと、URL・
+# 日付・予約番号等を誤って座席番号として取得してしまう恐れがあるため、
+# 以下の2つを両方満たす場合のみ採用する。
+# (1) 「搭乗者」「座席番号」という語が近接して現れる見出し文脈があること
+# (2) その見出しより後ろで、氏名の敬称「様」に続けて「/座席コード」という
+#     構造が見つかること
+# 見出し文脈が確認できない場合は一切抽出しない（安全側の設計）。
+_SKYMARK_SEAT_CONTEXT_RE = re.compile(r"搭乗者[^\n]{0,20}座席番号")
+_SKYMARK_PASSENGER_SEAT_RE = re.compile(r"様[^\n]{0,10}/\s*([0-9]{1,3}[A-Za-z])")
+
+
+def _extract_skymark_passenger_seat(body_text: str) -> str | None:
+    """「ご搭乗者／座席番号」という見出し文脈が確認できる場合に限り、
+    搭乗者情報末尾の「/19C」のような座席番号を抽出する。
+    """
+    context_match = _SKYMARK_SEAT_CONTEXT_RE.search(body_text)
+    if not context_match:
+        return None
+
+    passenger_match = _SKYMARK_PASSENGER_SEAT_RE.search(body_text[context_match.end():])
+    if not passenger_match:
+        return None
+
+    return passenger_match.group(1)
+
+
 def extract_skymark(
     message_id: str, relevance: str, subject: str, body_text: str
 ) -> ReservationCandidate:
@@ -1192,6 +1239,17 @@ def extract_skymark(
         [r"(?:予約番号|申込番号|受付番号)[:：]?\s*([A-Za-z0-9\-]+)"], body_text
     )
 
+    # パターンA（「座席番号：17H」等の明確なラベル）を優先し、無ければ
+    # パターンB（「ご搭乗者／座席番号」の見出し文脈がある場合の
+    # 「様.../19C」構造）を試す。座席番号は予約として重要な項目とは
+    # 別枠の付随情報のため、confidence判定（core_flags）には含めない
+    # （えきねっとの座席番号と同じ扱い）。
+    seat_number = _search_first(
+        [r"座席番号\s*[:：]\s*([0-9]{1,3}[A-Za-z])"], body_text
+    )
+    if not seat_number:
+        seat_number = _extract_skymark_passenger_seat(body_text)
+
     core_flags = {
         "boarding_date": bool(boarding_date_raw),
         "route": bool(origin) and bool(destination),
@@ -1208,6 +1266,7 @@ def extract_skymark(
         "destination": destination,
         "flight_number": flight_number,
         "reservation_reference": reservation_reference,
+        "seat_number": seat_number,
     }
     missing = [
         label for key, label in _SKYMARK_FIELD_LABELS.items() if not values.get(key)
@@ -1227,7 +1286,7 @@ def extract_skymark(
         destination=destination,
         train_name=None,
         car_number=None,
-        seat_number=None,
+        seat_number=seat_number,
         hotel_name=None,
         checkin_date=None,
         checkout_date=None,
