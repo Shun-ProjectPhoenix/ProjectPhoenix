@@ -9,6 +9,7 @@ import pandas as pd
 import streamlit as st
 
 import gmail_service
+import reservation_parser
 from components import (
     CATEGORY_OPTIONS,
     EDIT_TRIP_SELECT_KEY,
@@ -32,6 +33,7 @@ from components import (
     format_reservation_month_line,
     format_trip_line,
     pop_trip_jump,
+    render_registration_candidate_card,
     render_reservation_card,
     render_trip_card,
     render_trip_jump_button,
@@ -444,6 +446,21 @@ GMAIL_SEARCH_PERIOD_OPTIONS = [1, 3, 6, 12]
 GMAIL_CANDIDATES_SESSION_KEY = "tripflow_gmail_candidates"
 GMAIL_SEARCH_ERROR_SESSION_KEY = "tripflow_gmail_search_error"
 
+# Web v0.4 Phase C: 本文解析結果（登録候補）・解析エラーをmessage_idごとに
+# 保持する。ここに保存するのは抽出済みの構造化データ（ReservationCandidate）
+# とエラーメッセージ文字列のみで、メール本文全文・access tokenは含めない。
+# ログアウト時は既存の_clear_tripflow_session_state()（session_state.clear()）
+# でまとめて破棄される。
+GMAIL_ANALYSIS_RESULTS_SESSION_KEY = "tripflow_gmail_analysis_results"
+GMAIL_ANALYSIS_ERROR_SESSION_KEY = "tripflow_gmail_analysis_errors"
+
+_RELEVANCE_BADGES = {
+    reservation_parser.RELEVANCE_TARGET: "🟢 予約情報抽出対象",
+    reservation_parser.RELEVANCE_SUPPLEMENTARY: "🔵 予約補完メール（座席等の追加情報を含む可能性）",
+    reservation_parser.RELEVANCE_EXCLUDED: "⚪ 対象外（案内・レビュー依頼等の可能性）",
+    reservation_parser.RELEVANCE_UNKNOWN: "🟡 判定不能（手動で解析を試せます）",
+}
+
 
 def _gmail_selected_services(choice: str) -> list[str]:
     if choice == "両方":
@@ -457,8 +474,11 @@ def _render_gmail_search_section() -> None:
     access tokenはこの関数のローカル変数（関数呼び出しの引数）としてのみ
     扱い、session_stateやログ・画面には一切出さない。session_stateへ
     保存するのは、検索結果（件名・送信元・受信日時・snippetのみを持つ
-    候補オブジェクト）とエラーメッセージ文字列だけであり、本文全文や
-    access tokenは保持しない。ログアウト時は既存の
+    候補オブジェクト）、Phase Cで追加した本文解析結果（抽出済みの構造化
+    データ＝ReservationCandidate）、エラーメッセージ文字列だけであり、
+    本文全文やaccess tokenは保持しない。本文取得（Gmail API呼び出し）は
+    ユーザーが「予約情報を解析」ボタンを押した1件についてのみ行い、
+    候補一覧全件に対して自動的には行わない。ログアウト時は既存の
     _clear_tripflow_session_state()（session_state.clear()）で
     まとめて破棄される。
     """
@@ -526,13 +546,88 @@ def _render_gmail_search_section() -> None:
         if not candidates:
             st.caption("条件に一致するメールが見つかりませんでした。")
         else:
+            analysis_results = st.session_state.setdefault(
+                GMAIL_ANALYSIS_RESULTS_SESSION_KEY, {}
+            )
+            analysis_errors = st.session_state.setdefault(
+                GMAIL_ANALYSIS_ERROR_SESSION_KEY, {}
+            )
+
             for candidate in candidates:
+                relevance = reservation_parser.classify_candidate(
+                    candidate.service, candidate.subject
+                )
+
                 with st.container(border=True):
                     st.markdown(f"**{candidate.subject}**")
                     st.caption(f"{candidate.service}｜{candidate.received_at}")
                     st.caption(candidate.sender)
                     if candidate.snippet:
                         st.write(candidate.snippet)
+
+                    st.caption(
+                        _RELEVANCE_BADGES.get(relevance, relevance)
+                    )
+
+                    if reservation_parser.can_analyze(relevance):
+                        if st.button(
+                            "🔍 予約情報を解析",
+                            key=f"gmail_analyze_{candidate.message_id}",
+                        ):
+                            with st.spinner("メール本文を解析しています..."):
+                                try:
+                                    body = gmail_service.fetch_message_body(
+                                        st.user.tokens.access, candidate.message_id
+                                    )
+                                except gmail_service.GmailAPIError as e:
+                                    analysis_errors[candidate.message_id] = e.user_message
+                                    analysis_results.pop(candidate.message_id, None)
+                                except AttributeError:
+                                    # 解析ボタンを押した瞬間にaccess tokenが失効していた場合。
+                                    analysis_errors[candidate.message_id] = (
+                                        "Gmail連携の認証期限が切れました。"
+                                        "ログアウト後、再ログインしてください。"
+                                    )
+                                    analysis_results.pop(candidate.message_id, None)
+                                except Exception:
+                                    analysis_errors[candidate.message_id] = (
+                                        "メール本文の取得に失敗しました。"
+                                        "時間をおいて再度お試しください。"
+                                    )
+                                    analysis_results.pop(candidate.message_id, None)
+                                else:
+                                    try:
+                                        result = reservation_parser.analyze_email(
+                                            service=candidate.service,
+                                            message_id=candidate.message_id,
+                                            relevance=relevance,
+                                            subject=candidate.subject,
+                                            text_plain=body.text_plain,
+                                            text_html=body.text_html,
+                                            snippet=candidate.snippet,
+                                        )
+                                    except Exception:
+                                        analysis_errors[candidate.message_id] = (
+                                            "このメールは想定外の形式のため、"
+                                            "自動解析に対応していません。"
+                                        )
+                                        analysis_results.pop(candidate.message_id, None)
+                                    else:
+                                        analysis_results[candidate.message_id] = result
+                                        analysis_errors.pop(candidate.message_id, None)
+                    else:
+                        st.caption(
+                            "このメールは予約情報の抽出対象外と判定されたため、"
+                            "解析ボタンは表示していません。"
+                        )
+
+                    if candidate.message_id in analysis_errors:
+                        st.error(analysis_errors[candidate.message_id])
+
+                    if candidate.message_id in analysis_results:
+                        render_registration_candidate_card(
+                            analysis_results[candidate.message_id]
+                        )
 
 
 # --------------------------------------------------

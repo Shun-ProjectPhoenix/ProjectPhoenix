@@ -362,6 +362,79 @@ def render_trip_jump_button(
         st.rerun()
 
 
+# --------------------------------------------------
+# Web v0.4 Phase C: Gmail本文解析結果の「登録候補プレビュー」表示。
+# reservation_parser.ReservationCandidateを受け取り、実データに存在する
+# 値だけをカード表示する（無い項目は表示しない＝推測で埋めない）。
+# ここではDBへの保存は一切行わない（プレビュー表示専用）。
+# --------------------------------------------------
+def render_registration_candidate_card(candidate: Any) -> None:
+    """Gmail本文解析結果を、登録候補プレビューとしてカード形式で表示する。
+
+    種類（電車／ホテル／その他）に応じて表示項目を出し分け、値がNoneの
+    項目は表示しない。DBへの登録はPhase C時点では行わず、その旨を
+    常に案内する。
+    """
+    with st.container(border=True):
+        if candidate.reservation_type == "電車":
+            st.markdown(f"**🚄 {candidate.service}**")
+
+            if candidate.origin and candidate.destination:
+                st.markdown(f"{candidate.origin} → {candidate.destination}")
+            elif candidate.origin or candidate.destination:
+                st.markdown(candidate.origin or candidate.destination)
+
+            if candidate.date:
+                st.markdown(_format_date(candidate.date.isoformat()))
+
+            if candidate.train_name:
+                st.markdown(candidate.train_name)
+
+            car_seat_parts = [
+                part for part in (candidate.car_number, candidate.seat_number) if part
+            ]
+            if car_seat_parts:
+                st.markdown("　".join(car_seat_parts))
+
+            if candidate.start_time or candidate.end_time:
+                st.caption(f"{candidate.start_time or '？'} → {candidate.end_time or '？'}")
+
+        elif candidate.reservation_type == "ホテル":
+            st.markdown(f"**🏨 {candidate.service}**")
+
+            if candidate.hotel_name:
+                st.markdown(candidate.hotel_name)
+
+            if candidate.checkin_date:
+                st.markdown(f"チェックイン：{_format_date(candidate.checkin_date.isoformat())}")
+
+            if candidate.checkout_date:
+                st.markdown(
+                    f"チェックアウト：{_format_date(candidate.checkout_date.isoformat())}"
+                )
+
+            if candidate.amount is not None:
+                st.markdown(f"料金：{_format_amount(candidate.amount)}")
+
+        else:
+            st.markdown(f"**📌 {candidate.service}**")
+            if candidate.title:
+                st.markdown(candidate.title)
+
+        if candidate.reservation_reference:
+            st.caption(f"予約/申込番号：{candidate.reservation_reference}")
+
+        st.caption(f"解析結果の確度：{candidate.confidence}")
+
+        if candidate.missing_fields:
+            st.caption("取得できなかった項目：" + "、".join(candidate.missing_fields))
+
+        st.info(
+            "これは登録候補のプレビューです。TripFlowへの自動登録は行っておらず、"
+            "登録機能は今後のバージョンで実装予定です。"
+        )
+
+
 def clear_stale_selection(key: str, valid_ids: Iterable[int]) -> None:
     """session_state[key]が、現在有効なID一覧に含まれていなければクリアする。
 

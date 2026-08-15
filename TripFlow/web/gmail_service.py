@@ -1,17 +1,25 @@
-"""Gmail APIの読み取り専用呼び出しをまとめたモジュール（Web v0.4 Phase B）。
+"""Gmail APIの読み取り専用呼び出しをまとめたモジュール（Web v0.4 Phase B/C）。
 
-このモジュールが行うのは「予約メール候補の検索と、一覧表示に必要な
-最低限のメタデータ取得」までであり、本文の解析・DB保存は行わない。
+Phase Bまでは「予約メール候補の検索と、一覧表示に必要な最低限のメタデータ取得」
+までだった。Phase Cでは、それに加えて「予約情報抽出対象」と判定された1件の
+メールについてのみ、本文（text/plain・text/html）を取得する関数を追加する。
+本文の解析（分類・項目抽出）自体はこのモジュールでは行わず、reservation_parser.py
+に委ねる（責務分離。本文取得＝Gmail API呼び出しの詳細と、解析ロジックを
+混在させない）。
 
 - access tokenは呼び出し元（app.py）から引数として都度受け取るだけで、
   このモジュール内で保持・キャッシュ・ログ出力は一切しない。
 - Gmail API呼び出しは既存依存のhttpxで直接REST APIを叩く（新規ライブラリを
   追加しない方針のため）。
-- メール本文（payload.body等）は取得しない。取得するのはヘッダー
-  （件名・送信元・日付）とsnippet（Gmail側が生成する短い抜粋）のみ。
+- 候補一覧の取得では、メール本文（payload.body等）は取得しない。取得するのは
+  ヘッダー（件名・送信元・日付）とsnippet（Gmail側が生成する短い抜粋）のみ。
+  本文取得は、ユーザーが個別のメールに対して解析を指示したときのみ行う
+  （全候補メールの本文を無条件に取得することはしない）。
 """
 from __future__ import annotations
 
+import base64
+import binascii
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
@@ -230,4 +238,89 @@ def search_reservation_candidates(
 
     return sorted(
         candidates.values(), key=lambda c: c.internal_date_ms, reverse=True
+    )
+
+
+# --------------------------------------------------
+# Web v0.4 Phase C: 個別メールの本文取得。
+# 「予約情報抽出対象」と判定された1件について、ユーザーが解析を指示した
+# ときにだけ呼び出す想定（候補一覧全件への自動呼び出しはしない）。
+# --------------------------------------------------
+@dataclass(frozen=True)
+class GmailMessageBody:
+    """解析対象メール1件分の本文（プレーンテキスト・HTML）。
+
+    件名・送信元等のヘッダーは候補一覧（GmailMessageCandidate）に既に
+    保持しているため、ここでは本文のみを保持する。
+    """
+
+    message_id: str
+    text_plain: str
+    text_html: str
+
+
+def _decode_body_data(data: str | None) -> str:
+    """Gmail APIのbase64url（パディング省略あり）本文データをデコードする。
+
+    想定外の形式（デコード不能なデータ）が来てもcrashさせず、空文字列を返す。
+    """
+    if not data:
+        return ""
+
+    padded = data + "=" * (-len(data) % 4)
+
+    try:
+        raw_bytes = base64.urlsafe_b64decode(padded.encode("ascii"))
+    except (ValueError, UnicodeEncodeError, binascii.Error):
+        return ""
+
+    return raw_bytes.decode("utf-8", errors="replace")
+
+
+def _collect_body_parts(
+    payload: dict, plain_chunks: list[str], html_chunks: list[str]
+) -> None:
+    """payloadを再帰的にたどり、text/plainとtext/htmlの本文を集める。
+
+    multipart/alternative・multipart/mixed・multipart/related等、ネストした
+    partsを持つメールにも対応する。添付ファイル（attachmentIdのみを持ち、
+    dataを持たないパート）は本文として扱わず無視する。
+    """
+    mime_type = payload.get("mimeType", "")
+    body = payload.get("body", {}) or {}
+    data = body.get("data")
+
+    if data and "attachmentId" not in body:
+        decoded = _decode_body_data(data)
+        if decoded:
+            if mime_type == "text/plain":
+                plain_chunks.append(decoded)
+            elif mime_type == "text/html":
+                html_chunks.append(decoded)
+
+    for part in payload.get("parts", []) or []:
+        _collect_body_parts(part, plain_chunks, html_chunks)
+
+
+def fetch_message_body(access_token: str, message_id: str) -> GmailMessageBody:
+    """指定した1件のメールの本文（text/plain・text/html）を取得する。
+
+    「予約情報抽出対象」と判定されたメールについて、ユーザーが解析ボタンを
+    押したときに1件ずつ呼び出す想定であり、候補一覧の全件に対して自動的に
+    呼び出すことはしない。取得した本文はここでは一切ログ出力しない。
+    """
+    raw = _get(
+        f"{GMAIL_API_BASE}/users/me/messages/{message_id}",
+        access_token=access_token,
+        params={"format": "full"},
+    )
+
+    plain_chunks: list[str] = []
+    html_chunks: list[str] = []
+    _collect_body_parts(raw.get("payload", {}) or {}, plain_chunks, html_chunks)
+
+    return GmailMessageBody(
+        message_id=raw.get("id", message_id),
+        text_plain="\n".join(chunk for chunk in plain_chunks if chunk),
+        text_html="\n".join(chunk for chunk in html_chunks if chunk),
     )
