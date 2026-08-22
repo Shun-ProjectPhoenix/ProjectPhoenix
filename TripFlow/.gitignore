@@ -23,6 +23,15 @@ env/
 web/data/*
 !web/data/.gitkeep
 
+# Desktop版（v0.3〜v0.6）のCSVデータファイル。
+# desktop/versions/v0.3〜v0.6のCSV_FILEは"TripFlow/data/tripflow_data.csv"という
+# 相対パスを参照しており、リポジトリルートから当該Desktop版を実行すると
+# ここに出張・予約等の実データが書き込まれうる。現状の内容はサンプルデータ
+# だが、実データ誤コミット防止のため追跡対象から外す（Phase F-2）。
+# desktop/versions/v0.6/tripflow_data.csv（Desktop版フォルダ内の別ファイル）は
+# 対象外。
+/data/tripflow_data.csv
+
 # Environment variables
 .env
 

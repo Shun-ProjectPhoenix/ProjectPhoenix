@@ -895,3 +895,167 @@ seat_number = _search_first([r"座席番号\s*[:：]\s*([0-9]{1,3}[A-Za-z])"], b
 ### 22.3 既存サービスへの影響
 
 `extract_ekinet()`・`extract_agoda()`・`extract_smart_ex()`・`extract_skymark()`の抽出ロジック自体は変更していない（分類ルールの1キーワードのみを変更）。カード決済完了【購入済】の抽出結果（搭乗日・区間・便名・時刻・予約番号・座席番号・confidence「高」）、座席指定完了のSUPPLEMENTARY分類、予約完了【未購入】のUNKNOWN維持、搭乗日前日のお知らせのEXCLUDED維持は、いずれもテストで回帰確認した。
+
+---
+
+## 23. Web v0.4 Phase E-1：Gmailメタデータ列の追加（土台）
+
+Gmail経由の予約登録・重複防止・将来の類似判定に備え、`reservations`テーブルへ4列を追加した。この時点ではINSERT/UPDATE処理・重複チェック・キー生成ロジックは一切実装せず、列を安全に追加するだけに留めている。
+
+### 23.1 追加した列
+
+| 列名 | 用途 |
+|---|---|
+| `gmail_message_id` | GmailメッセージID。Phase E-3の重複登録防止で使用 |
+| `gmail_thread_id` | Gmailスレッド ID。将来、同一スレッド内の複数メールを扱う際の手がかり |
+| `source_type` | 予約の登録経路。`'manual'`（デフォルト）／`'gmail'` |
+| `reservation_key` | 将来の類似予約判定用キー（Phase E-1時点では生成しない。常にNULL） |
+
+### 23.2 `gmail_message_id`・`reservation_key`へUNIQUE制約を付けない理由
+
+- 同一予約が複数区間・複数泊・複数搭乗者にまたがる可能性があり、DB層で一意性を強制すると正当なケースでINSERTが失敗しうる
+- 重複防止の判定はPhase E-3でアプリケーション層（`database.is_gmail_message_registered()`）が担い、DB制約には委ねない設計方針とした
+- 他ユーザー間で同じ`gmail_message_id`が存在する可能性（同じメールを別アカウントで受信するなど）をDB制約で扱おうとすると、ユーザーをまたいだ一意性という誤った制約になってしまうため、そもそもDB制約では表現しない
+
+### 23.3 既存予約への影響
+
+既存の`insert_reservation()`呼び出し（新しい4引数を渡さない、従来通りの呼び出し）は、`source_type='manual'`・残り3列NULLのまま動作し、挙動は変わらない。マイグレーションは`ALTER TABLE`の冪等な追加のみで、既存データの値を書き換えない。
+
+---
+
+## 24. Web v0.4 Phase E-2：Gmail解析結果のTripFlowへの本登録
+
+Phase Cで実装した「登録候補プレビュー」に加えて、ユーザーが内容を確認したうえで実際にDBへ保存する機能を実装した。設計原則（8章）の「確認なしの自動登録をしない」「登録ボタンを押した場合のみ保存する」をそのまま踏襲している。
+
+### 24.1 登録可否とTARGET限定
+
+- `reservation_parser.can_register(relevance)`を新設し、`RELEVANCE_TARGET`の場合のみ`True`を返す
+- SUPPLEMENTARY・UNKNOWNは`can_analyze()`（解析可否）では引き続き`True`（ユーザーが手動で解析結果を確認することは可能）だが、`can_register()`は`False`。登録候補プレビューは表示されるが、「TripFlowに登録」ボタンは表示しない
+- EXCLUDEDは従来通り解析・登録のいずれも不可
+
+### 24.2 保存する内容
+
+- `insert_reservation()`にキーワード専用引数`gmail_message_id`・`gmail_thread_id`・`source_type`・`reservation_key`を追加した。デフォルト値を持たせているため、既存の手動登録の呼び出し（これらを指定しない呼び出し）は従来通り`source_type='manual'`・他3列NULLのまま動作する
+- Gmail経由の登録では`source_type='gmail'`・`gmail_message_id=candidate.message_id`・`gmail_thread_id=candidate.thread_id`を保存する。`reservation_key`はPhase E-2時点では生成しないため常にNULL
+
+### 24.3 予約種別の扱い
+
+- 交通（電車・飛行機）は、往路／復路／その他をユーザー自身が選択する（`GMAIL_REGISTRATION_TRANSIT_TYPE_OPTIONS`）。日付や区間からの自動判定は行わない
+- ホテルは`reservation_type`を`"ホテル"`に固定し、ユーザーへ選択させない
+
+### 24.4 title/memoへの変換方針
+
+`reservations`テーブルには、`origin`／`destination`／`start_time`／`end_time`／`train_name`／`flight_number`／`car_number`／`seat_number`／`fare_type`に対応する専用列がまだ無い。今回はDB列を追加せず、これらの情報を以下の2関数でtitle（区間つきの短い予約名）・memo（固定ラベル・固定順序の1行1項目形式）へ変換して保存する。
+
+- `build_reservation_title(candidate)`：列車名／便名＋区間、無ければホテル名、いずれも無ければ`candidate.title`にフォールバック
+- `build_reservation_memo(candidate)`：出発／到着／時刻／列車／便名／号車／座席／運賃種別を、値が存在する項目のみ固定順序で並べる。メールに存在しない値を推測で補うことはしない
+
+この設計をv1.0時点でも維持するかどうかの評価は、`claude_report.md`（Phase F監査）およびREADME「今後実装予定の機能（v1.1以降）」を参照。結論は「検索機能・類似判定機能を実装するタイミングでまとめて構造化列を検討する」であり、v1.0前の必須変更ではない。
+
+### 24.5 UI
+
+- 出張タブの「📧 Gmailから予約を探す」内、TARGETと判定されメール本文が解析済みの候補について、登録候補プレビューの下に登録先出張の選択・予約種別選択・登録内容確認・「TripFlowに登録」ボタンを表示する
+- ボタンが押された場合にのみ`insert_reservation()`を呼び出す。`OwnershipError`・`sqlite3.Error`はいずれも既存の書き込み系エラー表示パターンに合わせて日本語メッセージを表示する
+
+---
+
+## 25. Web v0.4 Phase E-3：`gmail_message_id`による二重登録防止
+
+同じGmailメッセージから同じ予約を2回以上TripFlowへ登録できてしまう問題に対応した。
+
+### 25.1 今回防止する重複の範囲
+
+今回防止するのは「**同じGmail message_idを持つメールから2回以上登録する**」ケースのみ。以下は意図的に対象外とし、将来課題として`claude_report.md`（Phase E-3報告）・本README「今後実装予定の機能」に明記している。
+
+- 同一予約についての別メール（購入済メール・座席指定メール・確認メール等。message_idが異なるため同一予約とは判定しない）
+- Gmail登録後に同じ予約を手動登録するケース
+- メール再送・更新でmessage_idが変わるケース
+- 予約番号・日付・区間等からの類似判定
+
+### 25.2 DB照合関数と所有者チェック
+
+`database.is_gmail_message_registered(user_id, gmail_message_id)`を新設した。
+
+- `reservations`テーブルにはuser_id列が無いため、`reservations.trip_id -> trips.user_id`のJOINを経由して**現在ユーザーの予約だけ**を検索する。他ユーザーが同じ`gmail_message_id`を持つ予約を登録していても、それによって現在ユーザーの登録をブロックしない
+- `gmail_message_id`が`None`・空文字列・空白のみの場合は、DBへ問い合わせず安全側として常に`False`を返す（手動登録のNULLは重複判定の対象にならない）
+- DB照合中に`sqlite3.Error`が発生した場合は、誤って「未登録」と判定して登録を続行しないよう、呼び出し側（`app.py`）でエラー表示のみ行い処理を中止する
+
+### 25.3 DB照合を正本、session_stateは補助
+
+- **DB側の`gmail_message_id`照合を永続的な正本とする。** ログアウト・ブラウザ更新・アプリ再起動・別セッションのいずれの後でも、DBに同じ`gmail_message_id`が存在すれば「登録済み」と判定される
+- 既存の`session_state`（`tripflow_gmail_registered_reservations`）は、同一セッション内の二重クリック防止・DB問い合わせを毎回省略するための補助として引き続き使用する。削除・置き換えはしていない
+
+### 25.4 画面表示時＋登録直前の二重チェック
+
+- 登録UI（「TripFlowに登録」ボタン等）を表示する前に、DBへ`is_gmail_message_registered()`を照会する。登録済みなら、ボタンの代わりに「✅ このメールはすでにTripFlowへ登録されています」と表示する
+- 画面表示時のチェックだけでは、二重クリックや複数タブ操作による競合を完全には防げないため、「TripFlowに登録」ボタンが押された直後・`insert_reservation()`を呼び出す直前にも、もう一度同じ照会を行う。この時点で既に登録済みであれば`INSERT`せず、「このメールはすでに登録されています」等を表示する
+
+### 25.5 DB UNIQUE制約は追加しない
+
+23.2で述べた理由（正当な複数区間・複数泊等での誤ったINSERT失敗を避ける、他ユーザー間の値衝突をDB制約で扱わない）により、今回もUNIQUE制約は追加していない。重複防止はあくまでアプリケーション層（`is_gmail_message_registered()`とその呼び出し側の2段階チェック）で行う。
+
+---
+
+## 26. Web v0.4 Phase E-4：予約日とTrip期間の自動マッチング
+
+実機確認で、「予約日を含む出張が登録されていないにもかかわらず、別の日程のTripが登録先として選択できてしまう」問題が判明したため対応した。
+
+### 26.1 基準日の選び方
+
+- 交通（電車・飛行機）：`candidate.date`
+- ホテル：`candidate.checkin_date`（`candidate.date`ではなくこちらを使う）
+- `reservation_parser.resolve_registration_date(candidate)`として切り出し、`reservation_type == "ホテル"`かどうかで選択する。基準日が取得できない（`None`）場合は、既存の「日付情報を取得できなかったため、この候補は登録できません」という安全側挙動をそのまま維持する
+
+### 26.2 Trip候補の絞り込み
+
+- `components.filter_matching_trips_for_candidate(all_trips, candidate_date)`を新設。`trip.start_date <= candidate_date <= trip.end_date`（境界値を含む）を満たすTripだけを、元の並び順のまま返す純粋関数とした
+- 「登録先の出張」selectboxの選択肢自体をこの関数の戻り値に絞り込む。以前は全Tripを選択肢にしたうえで日付一致Tripを初期選択位置の決定にしか使っていなかったが、Phase E-4で「選択肢自体を絞り込む」方式へ変更した
+
+### 26.3 一致件数ごとの挙動
+
+- **0件**：登録先selectbox・予約種別selectbox・登録内容確認・「TripFlowに登録」ボタンのいずれも表示しない。「この予約日を含む出張がTripFlowに登録されていません」「先に出張を登録してください」と案内する。この状態では`insert_reservation()`を呼ぶコードパスに到達しないため、DBへ登録できない
+- **1件**：一致した1件のみを選択肢に持つselectboxを表示する（固定表示ではなく、既存UIとの整合性を優先しselectboxのまま維持）。ユーザーは登録先出張名・期間を確認できるが、日付不一致Tripは選択肢に含まれないため選択できない
+- **複数件**：一致したTripだけを選択肢に持つselectboxを表示し、ユーザーに最終選択させる。自動的に1件へ決め打ちはしない
+
+出張が1件も登録されていない場合（`all_trips`が空）は、日付一致チェックより前の時点で「この予約を登録するには、先に出張を登録してください。」という既存の案内を維持する（上記「0件（一致なし）」の案内とは文言を分けている）。
+
+### 26.4 既存の登録済み判定との順序
+
+`_render_gmail_registration_controls()`内の判定順序は以下の通り。
+
+1. `can_register()`確認（呼び出し元）
+2. `session_state`登録済み確認
+3. DB`gmail_message_id`登録済み確認（Phase E-3）
+4. 候補日付確認（`resolve_registration_date()`）
+5. 日付一致Trip抽出（`filter_matching_trips_for_candidate()`）
+6. 登録UI表示
+
+既に登録済みの場合は、Trip候補照合より先に「すでに登録されています」表示で終了する。
+
+### 26.5 ホテルの整合性チェックの範囲
+
+初期段階ではチェックイン日がTrip期間内に含まれることのみを登録可否の条件とする。チェックアウト日がTrip終了日を超える場合などのより高度な整合性判定は、v1.0時点ではまだ実装していない（README「既知の制限事項」参照）。
+
+---
+
+## 27. Web v0.4 Phase F-1：ユーザー分離の回帰テスト・DB読み取りエラー保護
+
+v1.0完成度監査（`claude_report.md`）で指摘されたP0項目のうち、以下2点に対応した。新機能の追加は行っていない。
+
+### 27.1 ユーザー分離の回帰テスト
+
+`reservations`テーブルにuser_id列を持たせず、`reservations.trip_id -> trips.user_id`を経由して所有者判定する設計（12章・22章と同様の考え方）はそのまま維持し、`web/tests/test_database.py`に`UserIsolationRegressionTests`を追加した。
+
+- Trip：`fetch_trip`／`fetch_trips`／`update_trip`／`delete_trip`について、他ユーザーのIDを指定した場合に取得できない・一覧に現れない・更新も削除もされない（影響行数0）ことを確認
+- Reservation：`fetch_reservation`／`update_reservation`／`delete_reservation`／`fetch_reservations_by_trip`／`fetch_reservations_in_range`について同様に確認
+- `source_type='gmail'`の予約についても、手動登録と全く同じ所有者チェックが働くことを確認した。`database.py`のSQL文はGmail由来かどうかで分岐しておらず、専用のアクセス経路・チェック省略は存在しない
+- 既存の`insert_reservation()`の`OwnershipError`テストは変更していない
+
+### 27.2 `get_reservation_status()`のDB読み取りエラー保護
+
+`app.py`内で`get_reservation_status()`を直接呼んでいた5箇所（登録済みの出張一覧、ホーム画面の集計・内訳表示、直近の出張表示）だけが、他の読み取り処理（`safe_fetch()`）と異なりDBエラー未保護だった。
+
+- `_fetch_reservation_status_safe(user_id, trip_id)`を新設し、既存の`safe_fetch()`パターンをそのまま踏襲してラップした。新しい独自パターンは作っていない
+- DB読み取りに失敗した場合のフォールバック値は`{"outbound": False, "hotel": False, "return": False, "complete": False}`とし、「予約完了」等の正常状態として誤って扱わないようにした（`complete=False`のため常に「確認が必要」表示側へ倒れる）
+- `get_reservation_status()`自体の判定ロジック（往路／ホテル／復路の充足判定、`complete`の意味）は変更していない
+- 通常時（DBエラーが無い場合）のUI・動作は変更前と完全に同一
