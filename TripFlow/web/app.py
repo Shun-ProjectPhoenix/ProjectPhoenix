@@ -66,6 +66,37 @@ from database import (
 # 「他人のものだから失敗した」と推測できる情報は出さない。
 OWNERSHIP_ERROR_MESSAGE = "対象データが見つからないか、操作する権限がありません。"
 
+# get_reservation_status()がDB読み取りに失敗した場合の安全側デフォルト値
+# （Phase F-1）。「予約完了」等の正常状態として誤って扱わないよう、
+# 往路／ホテル／復路すべて未確認（False）・complete=Falseとし、
+# 呼び出し側では「確認が必要」表示側へ倒れるようにする。
+_RESERVATION_STATUS_UNKNOWN = {
+    "outbound": False,
+    "hotel": False,
+    "return": False,
+    "complete": False,
+}
+
+
+def _fetch_reservation_status_safe(user_id: int, trip_id: int) -> dict:
+    """get_reservation_status()を、他のDB読み取りと同じsafe_fetch()経由で呼ぶ（Phase F-1）。
+
+    これまでget_reservation_status()だけは他の読み取り処理と異なり
+    sqlite3.Errorに対して未保護で、DBエラー時にホーム画面・出張一覧の
+    描画全体がクラッシュしうる状態だった。既存のsafe_fetch()パターン
+    （書き込み以外の読み取り処理で既に使われているもの）をそのまま
+    踏襲し、エラー時は日本語メッセージを表示したうえで
+    _RESERVATION_STATUS_UNKNOWN（安全側のデフォルト）を返す。
+    get_reservation_status()自体の判定ロジックは変更しない。
+    """
+    return safe_fetch(
+        get_reservation_status,
+        user_id,
+        trip_id,
+        default=_RESERVATION_STATUS_UNKNOWN,
+        error_message="予約状況の確認に失敗しました。時間をおいて再度お試しください。",
+    )
+
 
 # --------------------------------------------------
 # ページの基本設定
@@ -1686,7 +1717,7 @@ with trips_tab:
                     "分類": trip["category"],
                     "予約状況": (
                         "✅ 予約完了"
-                        if get_reservation_status(user_id, trip["id"])["complete"]
+                        if _fetch_reservation_status_safe(user_id, trip["id"])["complete"]
                         else "⚠️ 確認が必要"
                     ),
                 }
@@ -1740,7 +1771,7 @@ with home_tab:
     attention_count = sum(
         1
         for trip in this_month_trips
-        if not get_reservation_status(user_id, trip["id"])["complete"]
+        if not _fetch_reservation_status_safe(user_id, trip["id"])["complete"]
     )
 
     st.subheader(f"{today.year}年{today.month}月")
@@ -1755,7 +1786,7 @@ with home_tab:
     incomplete_month_trips = [
         trip
         for trip in this_month_trips
-        if not get_reservation_status(user_id, trip["id"])["complete"]
+        if not _fetch_reservation_status_safe(user_id, trip["id"])["complete"]
     ]
 
     with st.expander(f"🧳 出張予定：{trip_count}件の内訳"):
@@ -1794,7 +1825,7 @@ with home_tab:
     with st.expander(f"⚠️ 確認が必要：{attention_count}件の内訳"):
         if incomplete_month_trips:
             for trip in incomplete_month_trips:
-                status = get_reservation_status(user_id, trip["id"])
+                status = _fetch_reservation_status_safe(user_id, trip["id"])
                 info_col, button_col = st.columns([4, 1])
                 with info_col:
                     st.markdown(
@@ -1823,7 +1854,7 @@ with home_tab:
 
     if upcoming_trips:
         for trip in upcoming_trips:
-            status = get_reservation_status(user_id, trip["id"])
+            status = _fetch_reservation_status_safe(user_id, trip["id"])
             trip_reservations = safe_fetch(
                 fetch_reservations_by_trip,
                 user_id,

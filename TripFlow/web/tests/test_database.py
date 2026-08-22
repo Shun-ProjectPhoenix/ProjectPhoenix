@@ -659,5 +659,241 @@ class IsGmailMessageRegisteredTests(_TempDatabaseTestCase):
         )
 
 
+class UserIsolationRegressionTests(_TempDatabaseTestCase):
+    """Phase F-1：ユーザー分離（他ユーザーのTrip/Reservationへアクセスできない
+    こと）の回帰テスト。
+
+    これまでinsert_reservation()のOwnershipErrorだけがテストされており、
+    fetch/update/deleteの所有者チェックは自動テストで担保されていなかった。
+    ここではユーザーA所有のTrip・Reservation（手動登録・Gmail由来の両方）に
+    対して、ユーザーBがfetch/update/deleteを試みても、ユーザーAのデータを
+    閲覧・変更・削除できないことを確認する。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        db.init_db()
+
+        self.user_a = db.get_or_create_user(
+            google_sub="isolation-test-user-a",
+            email="isolation-test-a@example.invalid",
+            display_name="ユーザーA",
+        )
+        self.user_b = db.get_or_create_user(
+            google_sub="isolation-test-user-b",
+            email="isolation-test-b@example.invalid",
+            display_name="ユーザーB",
+        )
+
+        self.trip_a_id = db.insert_trip(
+            user_id=self.user_a["id"],
+            name="ユーザーAの出張",
+            start_date=date(2026, 9, 1),
+            end_date=date(2026, 9, 5),
+            destination="ユーザーAの行き先",
+            category="業務",
+            memo="ユーザーAのメモ",
+        )
+
+        self.reservation_a_id = db.insert_reservation(
+            user_id=self.user_a["id"],
+            trip_id=self.trip_a_id,
+            reservation_type="往路",
+            reservation_service="えきねっと",
+            title="ユーザーAの予約（手動）",
+            reservation_date=date(2026, 9, 1),
+            amount=1000,
+            reservation_number="A-MANUAL-001",
+            reservation_url="",
+            status="予約済み",
+            memo="",
+        )
+
+        self.gmail_reservation_a_id = db.insert_reservation(
+            user_id=self.user_a["id"],
+            trip_id=self.trip_a_id,
+            reservation_type="復路",
+            reservation_service="えきねっと",
+            title="ユーザーAの予約（Gmail由来）",
+            reservation_date=date(2026, 9, 5),
+            amount=1000,
+            reservation_number="A-GMAIL-001",
+            reservation_url="",
+            status="予約済み",
+            memo="",
+            gmail_message_id="MSG-ISOLATION-A-001",
+            gmail_thread_id="THREAD-ISOLATION-A-001",
+            source_type="gmail",
+        )
+
+    # ---- Trip ----
+
+    def test_fetch_trip_by_other_user_returns_none(self) -> None:
+        self.assertIsNone(db.fetch_trip(self.user_b["id"], self.trip_a_id))
+        # ユーザーA自身からは引き続き取得できることも確認する。
+        self.assertIsNotNone(db.fetch_trip(self.user_a["id"], self.trip_a_id))
+
+    def test_fetch_trips_by_other_user_excludes_it(self) -> None:
+        trip_ids_for_b = [trip["id"] for trip in db.fetch_trips(self.user_b["id"])]
+        self.assertNotIn(self.trip_a_id, trip_ids_for_b)
+
+    def test_update_trip_by_other_user_does_not_change_it(self) -> None:
+        affected = db.update_trip(
+            user_id=self.user_b["id"],
+            trip_id=self.trip_a_id,
+            name="改ざんされた出張名",
+            start_date=date(2026, 10, 1),
+            end_date=date(2026, 10, 3),
+            destination="改ざんされた行き先",
+            category="プライベート",
+            memo="改ざんされたメモ",
+        )
+
+        # 既存仕様（update_trip()のdocstring）通り、影響行数0で失敗を表す。
+        self.assertEqual(affected, 0)
+
+        unchanged = db.fetch_trip(self.user_a["id"], self.trip_a_id)
+        self.assertEqual(unchanged["name"], "ユーザーAの出張")
+        self.assertEqual(unchanged["destination"], "ユーザーAの行き先")
+        self.assertEqual(unchanged["category"], "業務")
+
+    def test_delete_trip_by_other_user_does_not_delete_it(self) -> None:
+        affected = db.delete_trip(user_id=self.user_b["id"], trip_id=self.trip_a_id)
+
+        # 既存仕様（delete_trip()のdocstring）通り、影響行数0で失敗を表す。
+        self.assertEqual(affected, 0)
+        self.assertIsNotNone(db.fetch_trip(self.user_a["id"], self.trip_a_id))
+
+    # ---- Reservation（手動登録） ----
+
+    def test_fetch_reservation_by_other_user_returns_none(self) -> None:
+        self.assertIsNone(
+            db.fetch_reservation(self.user_b["id"], self.reservation_a_id)
+        )
+        self.assertIsNotNone(
+            db.fetch_reservation(self.user_a["id"], self.reservation_a_id)
+        )
+
+    def test_update_reservation_by_other_user_does_not_change_it(self) -> None:
+        affected = db.update_reservation(
+            user_id=self.user_b["id"],
+            reservation_id=self.reservation_a_id,
+            reservation_type="復路",
+            reservation_service="Agoda",
+            title="改ざんされた予約名",
+            reservation_date=date(2026, 12, 1),
+            amount=999999,
+            reservation_number="HACKED",
+            reservation_url="",
+            status="キャンセル",
+            memo="改ざんされたメモ",
+        )
+
+        self.assertEqual(affected, 0)
+
+        unchanged = db.fetch_reservation(self.user_a["id"], self.reservation_a_id)
+        self.assertEqual(unchanged["title"], "ユーザーAの予約（手動）")
+        self.assertEqual(unchanged["amount"], 1000)
+        self.assertEqual(unchanged["status"], "予約済み")
+
+    def test_delete_reservation_by_other_user_does_not_delete_it(self) -> None:
+        affected = db.delete_reservation(
+            user_id=self.user_b["id"], reservation_id=self.reservation_a_id
+        )
+
+        self.assertEqual(affected, 0)
+        self.assertIsNotNone(
+            db.fetch_reservation(self.user_a["id"], self.reservation_a_id)
+        )
+
+    def test_fetch_reservations_by_trip_with_other_users_trip_id_returns_empty(
+        self,
+    ) -> None:
+        # ユーザーBが、ユーザーAのtrip_idを直接指定しても、
+        # ユーザーAの予約一覧は一切返らない。
+        result = db.fetch_reservations_by_trip(self.user_b["id"], self.trip_a_id)
+        self.assertEqual(result, [])
+
+    def test_fetch_reservations_in_range_does_not_mix_other_users_reservations(
+        self,
+    ) -> None:
+        # ユーザーBにも同じ期間内に自分の出張・予約を作り、
+        # 「たまたま0件だから混ざっていないだけ」ではないことを確認する。
+        trip_b_id = db.insert_trip(
+            user_id=self.user_b["id"],
+            name="ユーザーBの出張",
+            start_date=date(2026, 9, 1),
+            end_date=date(2026, 9, 5),
+            destination="ユーザーBの行き先",
+            category="業務",
+            memo="",
+        )
+        reservation_b_id = db.insert_reservation(
+            user_id=self.user_b["id"],
+            trip_id=trip_b_id,
+            reservation_type="往路",
+            reservation_service="スマートEX",
+            title="ユーザーBの予約",
+            reservation_date=date(2026, 9, 2),
+            amount=2000,
+            reservation_number="B-001",
+            reservation_url="",
+            status="予約済み",
+            memo="",
+        )
+
+        result = db.fetch_reservations_in_range(
+            self.user_b["id"], date(2026, 9, 1), date(2026, 9, 5)
+        )
+        result_ids = [reservation["id"] for reservation in result]
+
+        self.assertIn(reservation_b_id, result_ids)
+        self.assertNotIn(self.reservation_a_id, result_ids)
+        self.assertNotIn(self.gmail_reservation_a_id, result_ids)
+
+    # ---- Reservation（Gmail由来） ----
+
+    def test_gmail_origin_reservation_is_also_isolated_by_user(self) -> None:
+        # Gmail由来（source_type='gmail'）だからといって、所有者チェックを
+        # 迂回する特別な経路は無いことを確認する。
+        self.assertIsNone(
+            db.fetch_reservation(self.user_b["id"], self.gmail_reservation_a_id)
+        )
+        self.assertIsNotNone(
+            db.fetch_reservation(self.user_a["id"], self.gmail_reservation_a_id)
+        )
+
+        by_trip_for_b = db.fetch_reservations_by_trip(
+            self.user_b["id"], self.trip_a_id
+        )
+        self.assertEqual(by_trip_for_b, [])
+
+        affected = db.delete_reservation(
+            user_id=self.user_b["id"], reservation_id=self.gmail_reservation_a_id
+        )
+        self.assertEqual(affected, 0)
+        self.assertIsNotNone(
+            db.fetch_reservation(self.user_a["id"], self.gmail_reservation_a_id)
+        )
+
+    def test_existing_crud_for_owner_still_works(self) -> None:
+        # 今回の追加テストが既存の正常系（自分自身のTrip/Reservationの
+        # CRUD）を壊していないことも合わせて確認する。
+        affected = db.update_trip(
+            user_id=self.user_a["id"],
+            trip_id=self.trip_a_id,
+            name="ユーザーAの出張（更新後）",
+            start_date=date(2026, 9, 1),
+            end_date=date(2026, 9, 6),
+            destination="ユーザーAの行き先",
+            category="業務",
+            memo="",
+        )
+        self.assertEqual(affected, 1)
+
+        updated = db.fetch_trip(self.user_a["id"], self.trip_a_id)
+        self.assertEqual(updated["name"], "ユーザーAの出張（更新後）")
+
+
 if __name__ == "__main__":
     unittest.main()
