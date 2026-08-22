@@ -151,6 +151,24 @@ def _reservation_bar_label(reservation: sqlite3.Row, day: date) -> str:
     return f"{icon} {reservation['reservation_type']}・{service}{status_suffix}"
 
 
+def filter_matching_trips_for_candidate(
+    all_trips: Iterable[sqlite3.Row], candidate_date: date
+) -> list[sqlite3.Row]:
+    """予約日（candidate_date）がstart_date〜end_dateに含まれるTripだけを返す（Phase E-4）。
+
+    Gmail解析候補の「登録先の出張」選択肢を、予約日と無関係な出張へ絞り込む
+    ための純粋関数。trip.start_date <= candidate_date <= trip.end_date を
+    満たすTripだけを、元の並び順のまま返す（一致0件なら空リスト）。
+    """
+    return [
+        trip
+        for trip in all_trips
+        if date.fromisoformat(trip["start_date"])
+        <= candidate_date
+        <= date.fromisoformat(trip["end_date"])
+    ]
+
+
 def _shift_month(target_date: date, delta: int) -> date:
     month_index = target_date.month - 1 + delta
     year = target_date.year + month_index // 12

@@ -29,6 +29,7 @@ from components import (
     _shift_month,
     _status_line,
     clear_stale_selection,
+    filter_matching_trips_for_candidate,
     format_reservation_line,
     format_reservation_month_line,
     format_trip_line,
@@ -508,6 +509,12 @@ def _render_gmail_registration_controls(
     ブラウザ更新・別セッションをまたいでも「登録済み」表示にする。
     DB照合中にエラーが発生した場合は、誤って未登録と判断して登録を
     続けさせないよう、エラー表示のみ行いボタンは表示しない。
+
+    さらに、予約日（交通はcandidate.date、ホテルはcandidate.checkin_date）が
+    出張期間（trip.start_date〜trip.end_date）に含まれる出張だけを
+    「登録先の出張」の選択肢にする（Phase E-4）。予約日と無関係な出張へ
+    誤って登録できないようにするための絞り込みで、一致する出張が
+    1件も無い場合は登録UI自体を表示しない。
     """
     if candidate.message_id in registered_map:
         st.success("✅ 登録済み")
@@ -532,10 +539,20 @@ def _render_gmail_registration_controls(
         return
 
     is_hotel = candidate.reservation_type == "ホテル"
-    registration_date = candidate.checkin_date if is_hotel else candidate.date
+    registration_date = reservation_parser.resolve_registration_date(candidate)
 
     if registration_date is None:
         st.warning("日付情報を取得できなかったため、この候補は登録できません。")
+        return
+
+    matching_trips = filter_matching_trips_for_candidate(all_trips, registration_date)
+
+    if not matching_trips:
+        st.warning(
+            f"⚠️ この予約日（{_format_date(registration_date.isoformat())}）"
+            "を含む出張がTripFlowに登録されていません。"
+        )
+        st.info("先に出張を登録してください。")
         return
 
     trip_options = {
@@ -544,27 +561,15 @@ def _render_gmail_registration_controls(
             f"（{_format_date(trip['start_date'])}"
             f"〜{_format_date(trip['end_date'])}）"
         )
-        for trip in all_trips
+        for trip in matching_trips
     }
     trip_id_list = list(trip_options.keys())
-
-    matching_trip_ids = [
-        trip["id"]
-        for trip in all_trips
-        if date.fromisoformat(trip["start_date"])
-        <= registration_date
-        <= date.fromisoformat(trip["end_date"])
-    ]
-
-    default_index = 0
-    if len(matching_trip_ids) == 1:
-        default_index = trip_id_list.index(matching_trip_ids[0])
 
     selected_trip_id = st.selectbox(
         "登録先の出張",
         options=trip_id_list,
         format_func=lambda trip_id: trip_options[trip_id],
-        index=default_index,
+        index=0,
         key=f"gmail_register_trip_{candidate.message_id}",
     )
 

@@ -1425,3 +1425,16 @@ def build_reservation_memo(candidate: ReservationCandidate) -> str:
         lines.append(f"運賃種別：{candidate.fare_type}")
 
     return "\n".join(lines)
+
+
+def resolve_registration_date(candidate: ReservationCandidate) -> date | None:
+    """登録候補から、Trip日付マッチングに使う基準日を1つ選ぶ（Phase E-4）。
+
+    ホテル（reservation_type == "ホテル"）はcandidate.checkin_dateを、
+    それ以外（電車／飛行機／その他）はcandidate.dateを基準日として使う。
+    取得できていない場合はNoneを返す（呼び出し側で「日付情報を取得できな
+    かったため登録できません」等、安全側の表示に使う想定）。
+    """
+    if candidate.reservation_type == "ホテル":
+        return candidate.checkin_date
+    return candidate.date
