@@ -562,6 +562,42 @@ def get_reservation_status(user_id: int, trip_id: int) -> dict:
     }
 
 
+def is_gmail_message_registered(user_id: int, gmail_message_id: str | None) -> bool:
+    """指定ユーザーの予約に、指定gmail_message_idを持つ行が既に存在するかを返す（Phase E-3）。
+
+    ここで防止するのは「同じGmail message_idからの二重登録」のみ。
+    reservationsテーブルにはuser_id列が無いため、必ず
+    reservations.trip_id -> trips.user_id を経由して現在ユーザーの
+    予約だけを対象にする。他ユーザーが同じgmail_message_idを持つ予約を
+    登録していても、それによって現在ユーザーの登録をブロックしない。
+
+    gmail_message_idがNone・空文字列・空白のみの場合は、安全側として
+    DBへ問い合わせず常にFalseを返す（手動登録のgmail_message_id=NULLは
+    重複判定の対象にならない）。
+
+    DB照合中にsqlite3.Errorが発生した場合は呼び出し側へそのまま伝播する。
+    誤って「未登録（False）」を返し登録を続行させないため。
+    """
+    if gmail_message_id is None or not gmail_message_id.strip():
+        return False
+
+    conn = get_connection()
+
+    try:
+        row = conn.execute(
+            """
+            SELECT 1 FROM reservations
+            JOIN trips ON reservations.trip_id = trips.id
+            WHERE trips.user_id = ? AND reservations.gmail_message_id = ?
+            LIMIT 1
+            """,
+            (user_id, gmail_message_id),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
 def insert_reservation(
     user_id: int,
     trip_id: int,

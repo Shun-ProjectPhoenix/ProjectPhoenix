@@ -521,5 +521,143 @@ class GmailInsertReservationTests(_TempDatabaseTestCase):
         self.assertEqual(reservation["source_type"], "manual")
 
 
+class IsGmailMessageRegisteredTests(_TempDatabaseTestCase):
+    """Phase E-3で追加したis_gmail_message_registered()を検証する。
+
+    ここで確認するのは「同じGmail message_idからの二重登録」防止のみ。
+    予約番号・日付・区間等による類似判定や、別メール間の同一予約判定は
+    対象外（今後のフェーズ）。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        db.init_db()
+        self.user = db.get_or_create_user(
+            google_sub="dedup-test-sub",
+            email="dedup-test@example.invalid",
+            display_name="重複防止テストユーザー",
+        )
+        self.trip_id = db.insert_trip(
+            user_id=self.user["id"],
+            name="重複防止テスト出張",
+            start_date=date(2026, 9, 1),
+            end_date=date(2026, 9, 5),
+            destination="テスト行き先",
+            category="業務",
+            memo="",
+        )
+
+    def _insert_gmail_reservation(self, gmail_message_id: str) -> int:
+        return db.insert_reservation(
+            user_id=self.user["id"],
+            trip_id=self.trip_id,
+            reservation_type="往路",
+            reservation_service="えきねっと",
+            title="重複防止テスト予約",
+            reservation_date=date(2026, 9, 1),
+            amount=1000,
+            reservation_number="R-DEDUP-001",
+            reservation_url="",
+            status="予約済み",
+            memo="",
+            gmail_message_id=gmail_message_id,
+            gmail_thread_id="THREAD-DEDUP-001",
+            source_type="gmail",
+        )
+
+    def test_same_user_same_message_id_is_registered(self) -> None:
+        self._insert_gmail_reservation("MSG-DEDUP-001")
+
+        self.assertTrue(
+            db.is_gmail_message_registered(self.user["id"], "MSG-DEDUP-001")
+        )
+
+    def test_same_user_different_message_id_is_not_registered(self) -> None:
+        self._insert_gmail_reservation("MSG-DEDUP-001")
+
+        self.assertFalse(
+            db.is_gmail_message_registered(self.user["id"], "MSG-DEDUP-999")
+        )
+
+    def test_other_users_same_message_id_does_not_block_current_user(self) -> None:
+        other_user = db.get_or_create_user(
+            google_sub="dedup-test-other-sub",
+            email="dedup-test-other@example.invalid",
+            display_name="別の重複防止テストユーザー",
+        )
+        other_trip_id = db.insert_trip(
+            user_id=other_user["id"],
+            name="別ユーザーの出張",
+            start_date=date(2026, 9, 1),
+            end_date=date(2026, 9, 5),
+            destination="テスト行き先",
+            category="業務",
+            memo="",
+        )
+        db.insert_reservation(
+            user_id=other_user["id"],
+            trip_id=other_trip_id,
+            reservation_type="往路",
+            reservation_service="えきねっと",
+            title="別ユーザーの予約",
+            reservation_date=date(2026, 9, 1),
+            amount=1000,
+            reservation_number="",
+            reservation_url="",
+            status="予約済み",
+            memo="",
+            gmail_message_id="MSG-DEDUP-SHARED",
+            gmail_thread_id="THREAD-DEDUP-SHARED",
+            source_type="gmail",
+        )
+
+        self.assertFalse(
+            db.is_gmail_message_registered(self.user["id"], "MSG-DEDUP-SHARED")
+        )
+
+    def test_none_message_id_is_not_registered(self) -> None:
+        self.assertFalse(db.is_gmail_message_registered(self.user["id"], None))
+
+    def test_empty_string_message_id_is_not_registered(self) -> None:
+        self.assertFalse(db.is_gmail_message_registered(self.user["id"], ""))
+
+    def test_whitespace_only_message_id_is_not_registered(self) -> None:
+        self.assertFalse(db.is_gmail_message_registered(self.user["id"], "   "))
+
+    def test_manual_reservation_with_null_message_id_is_not_matched(self) -> None:
+        # 手動登録（gmail_message_id=NULL）は重複判定の対象にならないことを
+        # 確認する。空白のみのmessage_idを渡した場合にNULL行と誤って
+        # 一致しないことも合わせて確認する。
+        db.insert_reservation(
+            user_id=self.user["id"],
+            trip_id=self.trip_id,
+            reservation_type="往路",
+            reservation_service="えきねっと",
+            title="手動登録予約",
+            reservation_date=date(2026, 9, 1),
+            amount=0,
+            reservation_number="",
+            reservation_url="",
+            status="予約済み",
+            memo="",
+        )
+
+        self.assertFalse(db.is_gmail_message_registered(self.user["id"], "   "))
+        self.assertFalse(
+            db.is_gmail_message_registered(self.user["id"], "MSG-NOT-PRESENT")
+        )
+
+    def test_becomes_registered_immediately_after_gmail_insert(self) -> None:
+        self.assertFalse(
+            db.is_gmail_message_registered(self.user["id"], "MSG-DEDUP-LATER")
+        )
+
+        self._insert_gmail_reservation("MSG-DEDUP-LATER")
+
+        self.assertTrue(
+            db.is_gmail_message_registered(self.user["id"], "MSG-DEDUP-LATER")
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

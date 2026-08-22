@@ -55,6 +55,7 @@ from database import (
     init_db,
     insert_reservation,
     insert_trip,
+    is_gmail_message_registered,
     update_reservation,
     update_trip,
 )
@@ -456,9 +457,13 @@ GMAIL_ANALYSIS_ERROR_SESSION_KEY = "tripflow_gmail_analysis_errors"
 
 # Web v0.4 Phase E-2B: 「TripFlowに登録」ボタンで実際にDBへ保存した
 # message_idを記録する（message_id → 保存したreservation_idの辞書）。
-# これはUI上の二重クリック防止のみが目的で、DB側の本格的な重複防止
-# （gmail_message_idの照合等）はPhase E-3以降で扱う。ログアウト時は
-# 既存の_clear_tripflow_session_state()（session_state.clear()）で
+# これは同一セッション内の二重クリック防止のみが目的で、あくまで
+# 補助的なもの。永続的な正本はDB側（gmail_message_id）であり、
+# Phase E-3ではdatabase.is_gmail_message_registered()を使って、
+# ログアウト・ブラウザ更新・別セッションをまたいだ二重登録防止を行う
+# （このsession_stateは引き続き、DB問い合わせを毎回省略するための
+# 二重クリック防止として残す）。ログアウト時は既存の
+# _clear_tripflow_session_state()（session_state.clear()）で
 # まとめて破棄される。
 GMAIL_REGISTERED_SESSION_KEY = "tripflow_gmail_registered_reservations"
 
@@ -490,16 +495,36 @@ def _render_gmail_registration_controls(
     registered_map: dict,
 ) -> None:
     """登録可能（TARGET）と判定された候補について、登録先出張の選択・
-    登録前の内容確認・「TripFlowに登録」ボタンを表示する（Phase E-2B）。
+    登録前の内容確認・「TripFlowに登録」ボタンを表示する（Phase E-2B／E-3）。
 
     自動登録は行わない。ボタンが押された場合にのみinsert_reservation()を
     呼び出す。既にこのセッション内で登録済みのmessage_idについては、
     ボタンの代わりに登録済み表示のみを行う（同一セッション内の二重
-    クリック防止が目的で、DB側の重複防止ではない。DB側の本格的な
-    重複防止はPhase E-3以降で検討する）。
+    クリック防止。DB問い合わせを毎回省略するための補助にすぎない）。
+
+    それに加えて、DB側（database.is_gmail_message_registered()）を
+    永続的な正本として確認する（Phase E-3）。同じgmail_message_idを
+    持つ予約が現在ユーザーに既に存在する場合は、ログアウト・
+    ブラウザ更新・別セッションをまたいでも「登録済み」表示にする。
+    DB照合中にエラーが発生した場合は、誤って未登録と判断して登録を
+    続けさせないよう、エラー表示のみ行いボタンは表示しない。
     """
     if candidate.message_id in registered_map:
         st.success("✅ 登録済み")
+        return
+
+    try:
+        already_registered = is_gmail_message_registered(
+            user_id, candidate.message_id
+        )
+    except sqlite3.Error:
+        st.error(
+            "登録済みかどうかの確認に失敗しました。時間をおいて再度お試しください。"
+        )
+        return
+
+    if already_registered:
+        st.success("✅ このメールはすでにTripFlowへ登録されています")
         return
 
     if not all_trips:
@@ -610,24 +635,32 @@ def _render_gmail_registration_controls(
         use_container_width=True,
     ):
         try:
-            reservation_id = insert_reservation(
-                user_id=user_id,
-                trip_id=selected_trip_id,
-                reservation_type=selected_reservation_type,
-                reservation_service=candidate.service,
-                title=title,
-                reservation_date=registration_date,
-                amount=candidate.amount if candidate.amount is not None else 0,
-                reservation_number=candidate.reservation_reference or "",
-                reservation_url="",
-                status="予約済み",
-                memo=memo,
-                check_in_date=candidate.checkin_date if is_hotel else None,
-                check_out_date=candidate.checkout_date if is_hotel else None,
-                gmail_message_id=candidate.message_id,
-                gmail_thread_id=candidate.thread_id,
-                source_type="gmail",
-            )
+            # 二重クリックや複数タブ等による競合に備え、insert_reservation()を
+            # 呼び出す直前にもう一度DBを確認する（Phase E-3）。画面表示時の
+            # チェックだけでは、表示後にクリックされるまでの間の競合を
+            # 防げないため。
+            if is_gmail_message_registered(user_id, candidate.message_id):
+                already_registered_at_submit = True
+            else:
+                already_registered_at_submit = False
+                reservation_id = insert_reservation(
+                    user_id=user_id,
+                    trip_id=selected_trip_id,
+                    reservation_type=selected_reservation_type,
+                    reservation_service=candidate.service,
+                    title=title,
+                    reservation_date=registration_date,
+                    amount=candidate.amount if candidate.amount is not None else 0,
+                    reservation_number=candidate.reservation_reference or "",
+                    reservation_url="",
+                    status="予約済み",
+                    memo=memo,
+                    check_in_date=candidate.checkin_date if is_hotel else None,
+                    check_out_date=candidate.checkout_date if is_hotel else None,
+                    gmail_message_id=candidate.message_id,
+                    gmail_thread_id=candidate.thread_id,
+                    source_type="gmail",
+                )
 
         except OwnershipError:
             st.error(OWNERSHIP_ERROR_MESSAGE)
@@ -636,9 +669,13 @@ def _render_gmail_registration_controls(
             st.error("予約の保存に失敗しました。時間をおいて再度お試しください。")
 
         else:
-            registered_map[candidate.message_id] = reservation_id
-            st.toast(f"「{title}」をTripFlowへ登録しました。", icon="✅")
-            st.rerun()
+            if already_registered_at_submit:
+                st.warning("このメールはすでに登録されています。")
+                st.rerun()
+            else:
+                registered_map[candidate.message_id] = reservation_id
+                st.toast(f"「{title}」をTripFlowへ登録しました。", icon="✅")
+                st.rerun()
 
 
 def _render_gmail_search_section(user_id: int, all_trips: list) -> None:
